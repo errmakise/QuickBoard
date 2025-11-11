@@ -1,0 +1,19 @@
+# 实时协作白板项目
+
+## 项目结构
+- `frontend/`: Vue.js前端项目
+- `backend/`: Node.js后端项目
+
+## 开发环境运行
+
+### 后端服务
+cd backend
+npm install
+node server.js
+# 后端服务将运行在 http://localhost:3000
+
+### 前端服务
+cd frontend
+npm install
+npm run dev
+# 前端服务将运行在 http://localhost:5173
