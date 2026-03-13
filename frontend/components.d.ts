@@ -14,6 +14,7 @@ declare module 'vue' {
   export interface GlobalComponents {
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
+    Whiteboard: typeof import('./src/components/Whiteboard.vue')['default']
   }
 }
 
@@ -21,4 +22,5 @@ declare module 'vue' {
 declare global {
   const RouterLink: typeof import('vue-router')['RouterLink']
   const RouterView: typeof import('vue-router')['RouterView']
+  const Whiteboard: typeof import('./src/components/Whiteboard.vue')['default']
 }

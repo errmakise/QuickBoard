@@ -1,11 +1,15 @@
-<script setup></script>
+<script setup>
+import Whiteboard from './components/Whiteboard.vue';
+</script>
 
 <template>
-  <h1>You did it!</h1>
-  <p>
-    Visit <a href="https://vuejs.org/" target="_blank" rel="noopener">vuejs.org</a> to read the
-    documentation
-  </p>
+  <!-- 全屏容器 -->
+  <div class="h-screen w-screen bg-gray-50 overflow-hidden">
+    <!-- 引入白板组件 -->
+    <Whiteboard />
+  </div>
 </template>
 
-<style scoped></style>
+<style scoped>
+/* 无需额外样式 */
+</style>

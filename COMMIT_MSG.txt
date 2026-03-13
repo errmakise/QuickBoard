@@ -1,0 +1,20 @@
+feat(mvp): 完成多人即时协作白板 MVP 版本开发
+
+主要变更：
+1. ✨ 核心功能实现
+   - 集成 Fabric.js 实现画布绘图（画笔、矩形、圆形、选择/变换模式）
+   - 基于 Socket.IO 实现多端实时数据同步
+   - 解决广播回环导致的闪烁问题 (Remote Update Flag)
+
+2. 🏗️ 架构重构与优化
+   - 前端服务层解耦：抽离 `SocketService` 单例模式
+   - 环境配置管理：引入 `.env` 管理 API 地址
+   - 样式升级：迁移至 Tailwind CSS v4
+
+3. 📝 文档建设
+   - 更新 `DEVELOPMENT_PLAN.md`：完成阶段一开发任务
+   - 完善 `LEARNING_NOTES.md`：新增工程化解耦与测试指南章节
+
+4. 🐛 问题修复
+   - 修复 Tailwind v4 与 PostCSS 配置冲突
+   - 修复 Socket.IO 依赖缺失导致的 500 错误
