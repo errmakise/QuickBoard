@@ -46,6 +46,19 @@ export class LogicalClock {
     // 追赶远程时间，并确保比它大 1
     this.time = Math.max(this.time, remoteTime) + 1;
   }
+
+  /**
+   * 重置逻辑时钟。
+   * 典型场景：
+   * - “房间重置 (Reset Room)”：服务端删除 roomStates 后，客户端需要回到“新房间初始态”；
+   * - 测试/调试：希望从 0 开始重新观察时间戳增长与冲突处理过程。
+   *
+   * 注意：
+   * - 这不是普通协同流程的一部分；不要在常规 join-room / sync-state 时调用，否则可能破坏因果顺序。
+   */
+  reset(time = 0) {
+    this.time = time;
+  }
 }
 
 export default new LogicalClock();

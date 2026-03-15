@@ -22,7 +22,21 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+*.bak
 
 # Build outputs
 dist/
 build/
+
+# Runtime state
+backend/roomStates.json
+README_old.md
+
+# Python (OCR service)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+ocr_service/.venv*/
+ocr_service/venv*/

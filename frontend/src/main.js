@@ -5,6 +5,7 @@ import App from './App.vue'
 import router from './router'
 
 import './assets/main.css' // 引入 Tailwind
+import 'katex/dist/katex.min.css'
 
 const app = createApp(App)
 

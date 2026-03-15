@@ -306,6 +306,16 @@ export class HistoryManager {
     this.undoStack.push(command); // 放回 undo 栈
     return command;
   }
+
+  /**
+   * 清空历史栈（撤销/重做）。
+   * 典型场景：
+   * - 房间重置：所有历史都应失效，避免用户在“新房间”里撤销出旧房间的操作。
+   */
+  reset() {
+    this.undoStack = [];
+    this.redoStack = [];
+  }
 }
 
 export default new HistoryManager();

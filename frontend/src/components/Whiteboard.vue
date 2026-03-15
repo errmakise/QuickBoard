@@ -1,7 +1,8 @@
 <script setup>
 defineOptions({ name: 'WhiteboardBoard' })
-import { onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import * as fabric from 'fabric';
+import katex from 'katex';
 import socketService from '../services/socket'; // 引入 Socket 服务
 import crdtManager from '../utils/crdt/CRDTManager'; // 引入 CRDT 管理器
 import historyManager, { AddCommand, RemoveCommand, ModifyCommand } from '../utils/History'; // 引入历史记录管理器
@@ -11,17 +12,78 @@ const isDev = import.meta.env?.DEV === true;
 const canvasEl = ref(null); // 对应 <canvas ref="canvasEl">
 let canvas = null; // 存放 Fabric Canvas 实例 (注意：不要用 ref 包裹它！)
 const objectMap = new Map(); // id -> fabricObject (用于快速查找)
+// Socket 连接状态（用于 UI 展示；不参与协同逻辑）
+// - connecting: 正在建立连接/重连中
+// - connected: 连接已建立
+// - disconnected: 连接断开（可能会自动重连）
+const connectionState = ref('connecting');
 
 // --- 光标相关 ---
 const cursorMap = new Map(); // userId -> { element, x, y }
 const myName = 'User ' + Math.floor(Math.random() * 1000); // 随机生成我的名字
 
+const lockState = ref({});
+const isFormulaEditorOpen = ref(false);
+const formulaEditorValue = ref('');
+const formulaPreviewHtml = computed(() => {
+  const src = (formulaEditorValue.value || '').trim();
+  if (!src) return '';
+  try {
+    return katex.renderToString(src, {
+      throwOnError: false,
+      displayMode: true,
+      strict: 'ignore'
+    });
+  } catch {
+    return '';
+  }
+});
+let formulaEditingObjectId = null;
+let formulaEditingBeforeJson = null;
+let formulaEditingLockResourceId = null;
+let formulaEditingLockRenewTimer = null;
+const selectedFormulaObjectId = ref(null);
+const selectedFormulaLockLabel = computed(() => {
+  const objectId = selectedFormulaObjectId.value;
+  if (!objectId) return '';
+  const resourceId = `formula:${objectId}`;
+  const l = lockState.value?.[resourceId];
+  if (!l) return '公式：未上锁';
+  const name = l.ownerName || l.ownerId || '未知用户';
+  return `公式：已上锁（${name}）`;
+});
+const isFormulaRecognizeMode = ref(false);
+const isFormulaRecognizing = ref(false);
+let formulaRecognizePrevTool = null;
+let formulaRecognizeStartPoint = null;
+let formulaRecognizeRect = null;
+const formulaRecognizeHint = computed(() => {
+  if (isFormulaRecognizing.value) return '识别中…';
+  if (isFormulaRecognizeMode.value) return '识别：拖拽框选区域（Esc 取消）';
+  return '';
+});
+
 // 当前选中的工具：'pencil' (画笔) | 'select' (选择/移动) | 'rect' (矩形) | 'circle' (圆形)
 const currentTool = ref('pencil');
 // socket 实例由 socketService 管理
 
-// 定义一个房间ID，暂时写死，后续可以做成动态的
-const ROOM_ID = 'demo-room';
+/**
+ * 从 URL Query 中读取房间号。
+ * 设计目的：
+ * - 允许多人通过分享链接进入同一房间；
+ * - 允许在本机用两个 tab 测试不同房间的隔离性；
+ * - 兼容多种参数名，减少后续改动成本。
+ */
+const getRoomIdFromUrl = () => {
+  const params = new URLSearchParams(window.location.search);
+  const room = params.get('room') || params.get('roomId') || params.get('r');
+  return room && room.trim() ? room.trim() : 'demo-room';
+};
+
+// 房间 ID 固定为组件生命周期内常量：本项目的“房间切换”使用刷新页面完成（更简单且稳定）
+const ROOM_ID = getRoomIdFromUrl();
+// 工具栏输入框：用于生成分享链接/切换房间（切换时会刷新页面）
+const roomIdInput = ref(ROOM_ID);
 // 标记是否是远程更新，防止回环死锁
 let isRemoteUpdate = false;
 // 标记是否是撤销/重做操作，防止重复压栈
@@ -33,8 +95,37 @@ let isMouseDown = false;
 let suppressNextLocalPathCreated = false;
 let suppressNextLocalPathCreatedTimeout = null;
 
+// --- 视图交互：平移/缩放 (Pan & Zoom) ---
+// 目标：每个客户端都可以自由漫游自己的视图（不影响协同数据，只改变本地 viewportTransform）
+let panKeyPressed = false; // 是否按住空格（按住空格拖拽平移）
+let isPanning = false; // 是否正在拖拽平移中
+let lastPanClientX = 0;
+let lastPanClientY = 0;
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 4;
+
 // 生成唯一ID
 const generateId = () => crypto.randomUUID();
+
+let fabricSerializationPatched = false;
+const patchFabricSerialization = () => {
+  if (fabricSerializationPatched) return;
+  const BaseObject = fabric.FabricObject || fabric.Object;
+  if (!BaseObject || !BaseObject.prototype) return;
+  const originalToObject = BaseObject.prototype.toObject;
+  if (typeof originalToObject !== 'function') return;
+
+  BaseObject.prototype.toObject = function (propertiesToInclude) {
+    const base = originalToObject.call(this, propertiesToInclude);
+    if (this.id) base.id = this.id;
+    if (this.excludeFromExport === true) base.excludeFromExport = true;
+    if (this.__isGhost === true) base.__isGhost = true;
+    if (this.isFormula === true) base.isFormula = true;
+    if (typeof this.latex === 'string') base.latex = this.latex;
+    return base;
+  };
+  fabricSerializationPatched = true;
+};
 
 // --- 辅助：创建 App 上下文对象，供 Command 使用 ---
 const getAppContext = () => ({
@@ -47,6 +138,8 @@ const getAppContext = () => ({
 
 // --- 生命周期：挂载 ---
 onMounted(() => {
+  patchFabricSerialization();
+
   // 1. 初始化 Fabric Canvas
   const fabricCanvas = new fabric.Canvas(canvasEl.value, {
     isDrawingMode: true, // 默认开启自由绘图模式
@@ -70,6 +163,7 @@ onMounted(() => {
 
   // 6. 监听键盘事件 (删除、撤销、重做)
   window.addEventListener('keydown', handleKeydown);
+  window.addEventListener('keyup', handleKeyup);
 
   // 撤销/重做保护机制变量已在模块级定义，确保各处理函数共享
 
@@ -84,8 +178,30 @@ onMounted(() => {
     }
   });
 
+  canvas.on('selection:created', refreshSelectedFormula);
+  canvas.on('selection:updated', refreshSelectedFormula);
+  canvas.on('selection:cleared', refreshSelectedFormula);
+
+  // 鼠标滚轮缩放（只影响本地视图，不影响协同数据）
+  canvas.on('mouse:wheel', handleCanvasMouseWheel);
+  // 双击复位视图（只影响本地视图）
+  canvas.on('mouse:dblclick', handleCanvasDoubleClick);
+
   // 5. 监听鼠标移动 (发送光标位置)
   canvas.on('mouse:move', (e) => {
+    if (isFormulaRecognizeMode.value === true) {
+      return;
+    }
+    // 正在平移时：只处理平移，不发送光标/实时绘制消息（避免无意义的网络噪声）
+    if (isPanning) {
+      handleCanvasPanMove(e);
+      return;
+    }
+    // 按住空格进入“视图漫游”语义：不发送协同光标/绘制过程消息
+    if (panKeyPressed) {
+      return;
+    }
+
     // 节流发送 (Throttle)
     // 鼠标移动事件触发频率极高 (每秒60+次)，如果每次都发送 WebSocket 消息，会造成“网络风暴”
     // 所以我们限制发送频率，每 50ms (即每秒 20 次) 最多发送一次
@@ -120,8 +236,21 @@ onMounted(() => {
   });
 
   // 手动追踪鼠标按键状态
-  canvas.on('mouse:down', () => { isMouseDown = true; });
-  canvas.on('mouse:up', () => { isMouseDown = false; });
+  canvas.on('mouse:down', (e) => {
+    isMouseDown = true;
+    // 如果本次 mouse down 用于平移视图，则不认为“正在绘图按下”
+    if (handleCanvasPanStart(e)) {
+      isMouseDown = false;
+    }
+  });
+  canvas.on('mouse:up', (e) => {
+    isMouseDown = false;
+    handleCanvasPanEnd(e);
+  });
+
+  canvas.on('mouse:down', handleFormulaRecognizeMouseDown);
+  canvas.on('mouse:move', handleFormulaRecognizeMouseMove);
+  canvas.on('mouse:up', handleFormulaRecognizeMouseUp);
 
   // 监听绘图结束，发送一个结束信号 (Ghost Brush)
   canvas.on('path:created', (e) => {
@@ -289,14 +418,53 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize);
   window.removeEventListener('keydown', handleKeydown);
+  window.removeEventListener('keyup', handleKeyup);
+  cancelFormulaRecognize();
+  void closeFormulaEditor(true);
   if (canvas) canvas.dispose();
   socketService.disconnect();
 });
+
+const handleLockState = (payload) => {
+  if (!payload || payload.roomId !== ROOM_ID) return;
+  const next = {};
+  const locks = Array.isArray(payload.locks) ? payload.locks : [];
+  locks.forEach((l) => {
+    if (!l || !l.resourceId) return;
+    next[l.resourceId] = {
+      resourceId: l.resourceId,
+      ownerId: l.ownerId,
+      ownerName: l.ownerName || '',
+      expiresAt: l.expiresAt
+    };
+  });
+  lockState.value = next;
+};
 
 // --- 方法：Socket 初始化 ---
 const initSocket = () => {
   // 连接后端服务器并加入房间
   socketService.connect(ROOM_ID);
+  connectionState.value = 'connecting';
+
+  // Socket.IO 内部具备自动重连机制，这里只做状态映射用于 UI 告知用户“当前是否在线”
+  socketService.on('connect', () => {
+    connectionState.value = 'connected';
+    // 连接/重连成功后，清理上一次断线残留的“临时 UI 状态”（远程光标/ghost 预览线）
+    // 原因：断线期间无法收到 user-left / drawing-end 等事件，可能导致本地残留“幽灵光标/幽灵线”。
+    cleanupEphemeralState();
+  });
+  socketService.on('disconnect', () => {
+    connectionState.value = 'disconnected';
+    // 断线时也主动清掉临时层，避免用户误以为远端还在线、还在绘制
+    cleanupEphemeralState();
+    lockState.value = {};
+    selectedFormulaObjectId.value = null;
+    void closeFormulaEditor(false);
+  });
+  socketService.on('connect_error', () => {
+    connectionState.value = 'disconnected';
+  });
 
   // 监听：CRDT 远程更新
   socketService.on('draw-event', (crdtState) => {
@@ -307,6 +475,8 @@ const initSocket = () => {
   // 监听：全量同步 (Initial Sync)
   socketService.on('sync-state', (allObjects) => {
     console.log('📦 Received initial sync state:', allObjects.length, 'objects');
+    // 初次同步/重连同步都是“服务端快照 + 后续增量”的模型：服务端只发存活对象，
+    // 本地如果曾记录 tombstone（_deleted），不会因为快照缺少 _deleted 字段而被复活。
     // 遍历所有对象，逐个合并
     allObjects.forEach(state => {
       // 由于 enlivenObjects 是异步的，为了保证顺序和性能，这里可以优化
@@ -336,6 +506,518 @@ const initSocket = () => {
   socketService.on('user-left', (data) => {
     removeRemoteCursor(data.userId);
   });
+
+  socketService.on('room-cleared', (data) => {
+    if (!data || data.roomId !== ROOM_ID) return;
+    applyRoomClear();
+  });
+
+  socketService.on('lock-state', (payload) => {
+    handleLockState(payload);
+  });
+};
+
+/**
+ * 统一执行“房间被清空”的本地收敛逻辑。
+ * 为什么需要单独封装？
+ * - 该操作不是普通的“删对象”，而是“重置房间状态”（包含 CRDT/History/临时 UI 状态）
+ * - 该操作可能来自本地点击，也可能来自远端广播，逻辑应完全一致
+ */
+const applyRoomClear = () => {
+  lockState.value = {};
+  selectedFormulaObjectId.value = null;
+  void closeFormulaEditor(true);
+
+  if (undoRedoTimeout) {
+    clearTimeout(undoRedoTimeout);
+    undoRedoTimeout = null;
+  }
+  if (suppressNextLocalPathCreatedTimeout) {
+    clearTimeout(suppressNextLocalPathCreatedTimeout);
+    suppressNextLocalPathCreatedTimeout = null;
+  }
+
+  undoRedoInProgress = false;
+  isUndoRedo = false;
+  suppressNextLocalPathCreated = false;
+  isMouseDown = false;
+
+  ghostPaths.clear();
+
+  for (const userId of Array.from(cursorMap.keys())) {
+    removeRemoteCursor(userId);
+  }
+
+  if (canvas && canvas.contextTop && canvas.clearContext) {
+    canvas.clearContext(canvas.contextTop);
+  }
+
+  if (canvas) {
+    canvas.clear();
+    canvas.backgroundColor = '#ffffff';
+  }
+
+  objectMap.clear();
+  historyManager.reset();
+  crdtManager.reset();
+};
+
+/**
+ * 清理“临时层（Ephemeral Layer）”状态：不影响正式对象、不会写入持久化。
+ * 包含：
+ * - Ghost Brush 预览线（按点流绘制的灰色 polyline）
+ * - 远程光标 DOM
+ * - Top context（Fabric 的上层临时绘制层）
+ */
+const cleanupEphemeralState = () => {
+  ghostPaths.clear();
+
+  for (const userId of Array.from(cursorMap.keys())) {
+    removeRemoteCursor(userId);
+  }
+
+  if (canvas && canvas.contextTop && canvas.clearContext) {
+    canvas.clearContext(canvas.contextTop);
+  }
+};
+
+/**
+ * 生成并复制“当前房间”的分享链接。
+ * 备注：只修改 query，不改变 pathname/hash，便于未来引入路由时保持兼容。
+ */
+const copyRoomLink = async () => {
+  const url = new URL(window.location.href);
+  url.searchParams.set('room', ROOM_ID);
+  const link = url.toString();
+
+  try {
+    await navigator.clipboard.writeText(link);
+    alert('已复制房间链接');
+  } catch {
+    window.prompt('复制失败，请手动复制：', link);
+  }
+};
+
+/**
+ * 切换房间：通过刷新页面进入新房间。
+ * 这么做的好处：
+ * - 避免“旧房间的 socket 监听、CRDT 状态、历史栈”残留导致的复杂边界问题
+ * - 与目前的项目结构（无路由、全局单白板）匹配
+ */
+const goToRoom = () => {
+  const nextRoomId = (roomIdInput.value || '').trim();
+  if (!nextRoomId) return;
+
+  const url = new URL(window.location.href);
+  url.searchParams.set('room', nextRoomId);
+  window.location.assign(url.toString());
+};
+
+const isFormulaObject = (obj) => {
+  return !!obj && (obj.isFormula === true || obj.latex !== undefined);
+};
+
+const getFormulaLockResourceId = (objectId) => {
+  return `formula:${objectId}`;
+};
+
+const refreshSelectedFormula = () => {
+  if (!canvas) {
+    selectedFormulaObjectId.value = null;
+    return;
+  }
+  const active = canvas.getActiveObject();
+  if (active && isFormulaObject(active) && active.id) {
+    selectedFormulaObjectId.value = active.id;
+    return;
+  }
+  selectedFormulaObjectId.value = null;
+};
+
+const cleanupFormulaRecognizeRect = () => {
+  if (!canvas) return;
+  if (formulaRecognizeRect) {
+    canvas.remove(formulaRecognizeRect);
+    formulaRecognizeRect = null;
+    canvas.requestRenderAll();
+  }
+};
+
+const applyFormulaRecognizeMode = (enabled) => {
+  if (!canvas) return;
+  if (enabled) {
+    if (!formulaRecognizePrevTool) {
+      formulaRecognizePrevTool = currentTool.value;
+    }
+    canvas.isDrawingMode = false;
+    canvas.selection = false;
+    canvas.skipTargetFind = true;
+    canvas.defaultCursor = 'crosshair';
+    canvas.hoverCursor = 'crosshair';
+    canvas.requestRenderAll();
+    return;
+  }
+  canvas.skipTargetFind = false;
+  canvas.defaultCursor = 'default';
+  canvas.hoverCursor = 'move';
+  if (formulaRecognizePrevTool) {
+    currentTool.value = formulaRecognizePrevTool;
+  }
+  formulaRecognizePrevTool = null;
+  if (panKeyPressed || isPanning) {
+    setPanMode(true);
+  } else {
+    applyToolMode();
+  }
+  canvas.requestRenderAll();
+};
+
+const cancelFormulaRecognize = () => {
+  isFormulaRecognizeMode.value = false;
+  isFormulaRecognizing.value = false;
+  formulaRecognizeStartPoint = null;
+  cleanupFormulaRecognizeRect();
+  applyFormulaRecognizeMode(false);
+};
+
+const startFormulaRecognize = () => {
+  if (!canvas) return;
+  if (isFormulaRecognizing.value) return;
+  if (panKeyPressed || isPanning) {
+    panKeyPressed = false;
+    isPanning = false;
+    setPanMode(false);
+  }
+  isFormulaRecognizeMode.value = true;
+  formulaRecognizeStartPoint = null;
+  cleanupFormulaRecognizeRect();
+  applyFormulaRecognizeMode(true);
+};
+
+const recognizeMathFromImage = async (imageDataUrl) => {
+  const envUrl = String(import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
+  const protocol = String(window.location?.protocol || 'http:');
+  const host = String(window.location?.hostname || 'localhost');
+  const apiUrl = envUrl || `${protocol}//${host}:3000`;
+
+  try {
+    const resp = await fetch(`${apiUrl}/api/recognize-math`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageDataUrl })
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const error = data && typeof data.error === 'string' ? data.error : 'HTTP_ERROR';
+      const status =
+        data && typeof data.status === 'number' ? data.status : typeof resp.status === 'number' ? resp.status : 0;
+      return { ok: false, error, status };
+    }
+    return data || { ok: false, error: 'EMPTY_RESPONSE' };
+  } catch {
+    return { ok: false, error: 'NETWORK_ERROR' };
+  }
+};
+
+const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
+  if (!canvas) return;
+  if (isFormulaRecognizing.value) return;
+  isFormulaRecognizing.value = true;
+
+  cleanupFormulaRecognizeRect();
+
+  const canvasW = canvas.getWidth();
+  const canvasH = canvas.getHeight();
+  const pad = Math.max(8, Math.min(24, Math.min(width, height) * 0.06));
+  const cropLeft = Math.max(0, left - pad);
+  const cropTop = Math.max(0, top - pad);
+  const cropRight = Math.min(canvasW, left + width + pad);
+  const cropBottom = Math.min(canvasH, top + height + pad);
+  const cropWidth = Math.max(1, cropRight - cropLeft);
+  const cropHeight = Math.max(1, cropBottom - cropTop);
+  const longest = Math.max(cropWidth, cropHeight);
+  let multiplier = longest > 600 ? 2 : longest > 350 ? 3 : 4;
+  while (multiplier > 2 && (cropWidth * multiplier > 1600 || cropHeight * multiplier > 1600)) {
+    multiplier -= 1;
+  }
+
+  const imageDataUrl = canvas.toDataURL({
+    format: 'png',
+    left: cropLeft,
+    top: cropTop,
+    width: cropWidth,
+    height: cropHeight,
+    multiplier
+  });
+
+  const result = await recognizeMathFromImage(imageDataUrl);
+  const latex = typeof result?.latex === 'string' ? result.latex : '';
+  const debugProcessed =
+    result && result.debug && typeof result.debug.processedImageDataUrl === 'string'
+      ? result.debug.processedImageDataUrl
+      : '';
+  if (debugProcessed) {
+    window.__ocrDebugLast = result.debug;
+    if (!window.__ocrDebugHintShown) {
+      window.__ocrDebugHintShown = true;
+      alert('已生成 OCR 调试图：按 F12 打开 Console，输入 window.__ocrDebugLast 查看。');
+    }
+  }
+
+  isFormulaRecognizeMode.value = false;
+  applyFormulaRecognizeMode(false);
+  isFormulaRecognizing.value = false;
+
+  if (!result || result.ok !== true) {
+    const err = result?.error || 'UNKNOWN_ERROR';
+    const status = typeof result?.status === 'number' ? result.status : null;
+    const detail = typeof result?.detail === 'string' ? result.detail.trim() : '';
+    if (err === 'NOT_CONFIGURED') {
+      alert('识别服务未配置。');
+    } else if (err === 'NETWORK_ERROR') {
+      alert('识别失败：无法连接到后端（请确认后端已启动，且 VITE_API_URL 配置正确）。');
+    } else if (err === 'UPSTREAM_ERROR') {
+      alert(
+        `识别失败：本地识别服务不可用或返回错误${status ? `（HTTP ${status}）` : ''}${detail ? `：${detail}` : ''}。`
+      );
+    } else if (err === 'EMPTY_LATEX') {
+      alert('识别失败：识别服务未返回 latex。');
+    } else {
+      alert(`公式识别失败（${err}${status ? `, HTTP ${status}` : ''}），请重试或手动编辑。`);
+    }
+    return;
+  }
+  if (!latex.trim()) {
+    alert('识别失败：返回的 LaTeX 为空，请重试或手动编辑。');
+    return;
+  }
+
+  const textbox = new fabric.Textbox(latex, {
+    left: cropLeft,
+    top: cropTop,
+    width: Math.max(220, Math.min(520, cropWidth)),
+    fontSize: 22,
+    fill: '#000000',
+    backgroundColor: 'rgba(255,255,255,0.8)',
+    borderColor: '#93c5fd',
+    cornerColor: '#3b82f6',
+    padding: 6,
+    editable: false
+  });
+  textbox.isFormula = true;
+  textbox.latex = latex;
+  textbox.excludeFromExport = false;
+
+  canvas.add(textbox);
+  canvas.setActiveObject(textbox);
+  canvas.requestRenderAll();
+
+  setTimeout(() => {
+    if (!textbox.id) return;
+    openFormulaEditor(textbox);
+  }, 0);
+};
+
+const handleFormulaRecognizeMouseDown = (e) => {
+  if (isFormulaRecognizeMode.value !== true) return;
+  if (!canvas) return;
+  if (isFormulaRecognizing.value) return;
+  const p = e?.scenePoint;
+  if (!p) return;
+
+  formulaRecognizeStartPoint = { x: p.x, y: p.y };
+  cleanupFormulaRecognizeRect();
+
+  const rect = new fabric.Rect({
+    originX: 'left',
+    originY: 'top',
+    left: p.x,
+    top: p.y,
+    width: 1,
+    height: 1,
+    fill: 'rgba(59, 130, 246, 0.12)',
+    stroke: '#3b82f6',
+    strokeWidth: 2,
+    strokeDashArray: [6, 4],
+    selectable: false,
+    evented: false
+  });
+  rect.__isGhost = true;
+  rect.excludeFromExport = true;
+  formulaRecognizeRect = rect;
+  canvas.add(rect);
+  canvas.requestRenderAll();
+  if (e?.e?.preventDefault) e.e.preventDefault();
+};
+
+const handleFormulaRecognizeMouseMove = (e) => {
+  if (isFormulaRecognizeMode.value !== true) return;
+  if (!canvas) return;
+  if (!formulaRecognizeRect || !formulaRecognizeStartPoint) return;
+  const p = e?.scenePoint;
+  if (!p) return;
+
+  const x0 = formulaRecognizeStartPoint.x;
+  const y0 = formulaRecognizeStartPoint.y;
+  const left = Math.min(x0, p.x);
+  const top = Math.min(y0, p.y);
+  const width = Math.abs(p.x - x0);
+  const height = Math.abs(p.y - y0);
+
+  formulaRecognizeRect.set({ left, top, width, height });
+  canvas.requestRenderAll();
+  if (e?.e?.preventDefault) e.e.preventDefault();
+};
+
+const handleFormulaRecognizeMouseUp = async () => {
+  if (isFormulaRecognizeMode.value !== true) return;
+  if (!canvas) return;
+  if (!formulaRecognizeRect || !formulaRecognizeStartPoint) return;
+
+  const left = formulaRecognizeRect.left || 0;
+  const top = formulaRecognizeRect.top || 0;
+  const width = formulaRecognizeRect.width || 0;
+  const height = formulaRecognizeRect.height || 0;
+
+  formulaRecognizeStartPoint = null;
+
+  if (width < 10 || height < 10) {
+    cancelFormulaRecognize();
+    return;
+  }
+
+  await finalizeFormulaRecognize({ left, top, width, height });
+};
+
+const stopFormulaLockRenew = () => {
+  if (!formulaEditingLockRenewTimer) return;
+  clearInterval(formulaEditingLockRenewTimer);
+  formulaEditingLockRenewTimer = null;
+};
+
+const closeFormulaEditor = async (releaseLock = true) => {
+  stopFormulaLockRenew();
+
+  if (releaseLock && formulaEditingLockResourceId) {
+    try {
+      await socketService.releaseLock({
+        roomId: ROOM_ID,
+        resourceId: formulaEditingLockResourceId
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  isFormulaEditorOpen.value = false;
+  formulaEditorValue.value = '';
+  formulaEditingObjectId = null;
+  formulaEditingBeforeJson = null;
+  formulaEditingLockResourceId = null;
+};
+
+const saveFormulaEditor = async () => {
+  if (!canvas) return;
+  if (!formulaEditingObjectId) return;
+
+  const obj = objectMap.get(formulaEditingObjectId);
+  if (!obj) {
+    await closeFormulaEditor(true);
+    return;
+  }
+
+  const beforeJson = formulaEditingBeforeJson || obj.toJSON();
+  obj.latex = formulaEditorValue.value;
+  obj.text = formulaEditorValue.value;
+
+  obj.setCoords();
+  canvas.requestRenderAll();
+
+  const afterJson = obj.toJSON();
+  historyManager.push(new ModifyCommand(getAppContext(), obj, beforeJson, afterJson));
+
+  const crdtState = crdtManager.localUpdate(obj.id, afterJson);
+  socketService.emit('draw-event', {
+    roomId: ROOM_ID,
+    ...crdtState
+  });
+
+  await closeFormulaEditor(true);
+};
+
+const openFormulaEditor = async (obj) => {
+  if (!obj || !obj.id) return;
+
+  const resourceId = getFormulaLockResourceId(obj.id);
+  const resp = await socketService.acquireLock({
+    roomId: ROOM_ID,
+    resourceId,
+    ownerName: myName,
+    ttlMs: 15000
+  });
+
+  if (!resp || resp.ok !== true) {
+    const lockedBy = resp && resp.lockedBy;
+    if (lockedBy) {
+      const name = lockedBy.ownerName || lockedBy.ownerId || '未知用户';
+      alert(`该公式正在被「${name}」编辑中，请稍后再试。`);
+    } else {
+      alert('当前无法进入公式编辑，请稍后重试。');
+    }
+    return;
+  }
+
+  obj.editable = false;
+  await closeFormulaEditor(false);
+
+  formulaEditingObjectId = obj.id;
+  formulaEditingBeforeJson = obj.toJSON();
+  formulaEditingLockResourceId = resourceId;
+  formulaEditorValue.value = typeof obj.latex === 'string' ? obj.latex : (obj.text || '');
+  isFormulaEditorOpen.value = true;
+
+  stopFormulaLockRenew();
+  formulaEditingLockRenewTimer = setInterval(async () => {
+    if (!formulaEditingLockResourceId) return;
+    const renewResp = await socketService.renewLock({
+      roomId: ROOM_ID,
+      resourceId: formulaEditingLockResourceId,
+      ttlMs: 15000
+    });
+    if (!renewResp || renewResp.ok !== true) {
+      await closeFormulaEditor(false);
+      alert('公式编辑锁已失效，已自动退出编辑。');
+    }
+  }, 5000);
+};
+
+const insertFormula = () => {
+  if (!canvas) return;
+
+  const textbox = new fabric.Textbox('', {
+    left: 200,
+    top: 150,
+    width: 260,
+    fontSize: 22,
+    fill: '#000000',
+    backgroundColor: 'rgba(255,255,255,0.8)',
+    borderColor: '#93c5fd',
+    cornerColor: '#3b82f6',
+    padding: 6,
+    editable: false
+  });
+  textbox.isFormula = true;
+  textbox.latex = '';
+  textbox.excludeFromExport = false;
+
+  canvas.add(textbox);
+  canvas.setActiveObject(textbox);
+  canvas.requestRenderAll();
+
+  setTimeout(() => {
+    if (!textbox.id) return;
+    openFormulaEditor(textbox);
+  }, 0);
 };
 
 // --- 方法：处理本地鼠标移动 (节流发送) ---
@@ -423,22 +1105,46 @@ const updateRemoteCursor = ({ userId, x, y, userName }) => {
     // 将光标添加到 Canvas 容器的父级
     if (canvasEl.value && canvasEl.value.parentElement) {
       canvasEl.value.parentElement.appendChild(el);
-      cursor = { el };
+      cursor = { el, x: 0, y: 0 };
       cursorMap.set(userId, cursor);
     } else {
       return;
     }
   }
 
-  // 更新位置 (使用 transform 性能更好)
-  // 注意：我们使用 CSS transform 来移动光标
-  // 必须确保 .absolute 的父容器 (div.relative) 的左上角与 Canvas 的 (0,0) 重合
-  // translate(x, y) 是相对于元素初始位置的偏移
-  // 如果元素初始 left/top 未设置，可能会受 padding/margin 影响
-  // 所以我们在 style 中强制设置 left:0, top:0
+  // 存储远端光标的“世界坐标（canvas 坐标）”，在视图平移/缩放时可用来重新计算屏幕位置
+  cursor.x = x;
+  cursor.y = y;
+
+  applyRemoteCursorTransform(cursor);
+};
+
+/**
+ * 将远端光标的“世界坐标”映射到当前视图的“屏幕坐标”，并更新 DOM 位置。
+ * 说明：
+ * - 协同传输的是世界坐标（对象/路径同一坐标系）；
+ * - 每个客户端 viewportTransform 不同，所以必须在渲染阶段做一次变换。
+ */
+const applyRemoteCursorTransform = (cursor) => {
+  if (!cursor?.el) return;
+  if (!canvas) return;
+
+  const vpt = canvas.viewportTransform;
+  const worldPoint = new fabric.Point(cursor.x || 0, cursor.y || 0);
+  const screenPoint = vpt ? fabric.util.transformPoint(worldPoint, vpt) : worldPoint;
+
   cursor.el.style.left = '0px';
   cursor.el.style.top = '0px';
-  cursor.el.style.transform = `translate(${x}px, ${y}px)`;
+  cursor.el.style.transform = `translate(${screenPoint.x}px, ${screenPoint.y}px)`;
+};
+
+/**
+ * 当视图发生变化（平移/缩放）时，刷新所有远端光标的位置。
+ */
+const refreshRemoteCursors = () => {
+  for (const cursor of cursorMap.values()) {
+    applyRemoteCursorTransform(cursor);
+  }
 };
 
 // --- 方法：移除远程光标 ---
@@ -495,6 +1201,12 @@ const handleRemoteUpdate = (crdtState) => {
   }
   // 如果是现有对象且包含删除标记
   if (!isNew && changes._deleted) {
+    if (crdtState.id && crdtState.id === formulaEditingObjectId) {
+      void closeFormulaEditor(true);
+    }
+    if (crdtState.id && selectedFormulaObjectId.value === crdtState.id) {
+      selectedFormulaObjectId.value = null;
+    }
     const obj = objectMap.get(crdtState.id);
     if (obj) {
       canvas.remove(obj);
@@ -513,6 +1225,9 @@ const handleRemoteUpdate = (crdtState) => {
         obj.__fromRemote = true;
         // 对于远端的 path，也不会触发本地入栈，因为我们在 object:added 对 path 直接 return
         obj.id = crdtState.id; // 绑定 ID
+        if (isFormulaObject(obj)) {
+          obj.editable = false;
+        }
         objectMap.set(obj.id, obj);
         canvas.add(obj);
         // 下一拍移除标记
@@ -528,6 +1243,9 @@ const handleRemoteUpdate = (crdtState) => {
     const obj = objectMap.get(crdtState.id);
     if (obj && Object.keys(changes).length > 0) {
       obj.set(changes);
+      if (isFormulaObject(obj)) {
+        obj.editable = false;
+      }
       obj.setCoords(); // 更新坐标控制点
       canvas.requestRenderAll();
     }
@@ -542,6 +1260,191 @@ const handleResize = () => {
     canvas.setWidth(window.innerWidth);
     canvas.setHeight(window.innerHeight);
     canvas.renderAll();
+  }
+};
+
+/**
+ * 将“当前工具状态”应用到 Fabric Canvas。
+ * 注意：这里仅控制本地交互（绘图/选择），不参与协同同步。
+ */
+const applyToolMode = () => {
+  if (!canvas) return;
+
+  if (currentTool.value === 'pencil') {
+    canvas.isDrawingMode = true;
+    canvas.selection = false;
+  } else {
+    canvas.isDrawingMode = false;
+    canvas.selection = true;
+  }
+};
+
+/**
+ * 开启/关闭“视图平移模式”。
+ * 平移模式是“只影响本地视图”的能力：
+ * - 禁用选择命中与绘图，避免拖拽时误选中/误画到对象；
+ * - 仅通过 viewportTransform 改变视图位置。
+ */
+const setPanMode = (enabled) => {
+  if (!canvas) return;
+
+  if (enabled) {
+    canvas.isDrawingMode = false;
+    canvas.selection = false;
+    canvas.skipTargetFind = true;
+    canvas.defaultCursor = 'grab';
+    canvas.hoverCursor = 'grab';
+  } else {
+    canvas.skipTargetFind = false;
+    canvas.defaultCursor = 'default';
+    canvas.hoverCursor = 'move';
+    applyToolMode();
+  }
+
+  canvas.requestRenderAll();
+};
+
+/**
+ * 鼠标滚轮缩放：围绕鼠标所在屏幕点进行缩放。
+ * - 只改变本地视图（viewportTransform），不改变对象数据；
+ * - 每个客户端可拥有不同的缩放级别，不影响协同一致性。
+ */
+const handleCanvasMouseWheel = (e) => {
+  if (!canvas) return;
+  if (!e || !e.e) return;
+
+  const wheelEvent = e.e;
+  wheelEvent.preventDefault();
+  wheelEvent.stopPropagation();
+
+  const delta = wheelEvent.deltaY;
+  let zoom = canvas.getZoom();
+  zoom *= 0.999 ** delta;
+  zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom));
+
+  const zoomPoint = new fabric.Point(wheelEvent.offsetX, wheelEvent.offsetY);
+  canvas.zoomToPoint(zoomPoint, zoom);
+
+  refreshRemoteCursors();
+};
+
+/**
+ * 双击复位视图。
+ * 说明：
+ * - 与工具栏“复位”按钮共享同一逻辑；
+ * - 只改变 viewportTransform，不改变任何对象属性，因此不会触发协同同步。
+ */
+const handleCanvasDoubleClick = (e) => {
+  if (!canvas) return;
+  if (e?.e?.preventDefault) e.e.preventDefault();
+  const target = e && e.target;
+  if (target && isFormulaObject(target)) {
+    openFormulaEditor(target);
+    return;
+  }
+  resetView();
+};
+
+/**
+ * 获取当前视图中心点（屏幕坐标）。
+ * 用途：缩放时将中心作为缩放锚点（滚轮缩放则用鼠标点作为锚点）。
+ */
+const getViewportCenterPoint = () => {
+  if (!canvas) return new fabric.Point(0, 0);
+  const center = canvas.getCenter();
+  return new fabric.Point(center.left, center.top);
+};
+
+/**
+ * 以视图中心为锚点缩放。
+ * @param {number} factor - 缩放倍率（例如 1.1 表示放大 10%，0.9 表示缩小 10%）
+ */
+const zoomByFactor = (factor) => {
+  if (!canvas) return;
+  if (!factor || !Number.isFinite(factor)) return;
+
+  const centerPoint = getViewportCenterPoint();
+  let zoom = canvas.getZoom();
+  zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom * factor));
+  canvas.zoomToPoint(centerPoint, zoom);
+  refreshRemoteCursors();
+};
+
+/**
+ * 复位视图到初始状态：zoom=1、平移=0。
+ * 注意：
+ * - 复位的是“视图”（viewportTransform），不会影响对象坐标；
+ * - 远端光标是世界坐标，需要在复位后重新映射一次屏幕位置。
+ */
+const resetView = () => {
+  if (!canvas) return;
+
+  canvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
+  canvas.setZoom(1);
+  canvas.requestRenderAll();
+  refreshRemoteCursors();
+};
+
+const zoomIn = () => zoomByFactor(1.1);
+const zoomOut = () => zoomByFactor(0.9);
+
+/**
+ * 判断是否应当触发“视图平移”。
+ * 触发方式：
+ * - 按住空格 + 左键拖拽；
+ * - 或中键拖拽（不依赖键盘）。
+ */
+const shouldStartPan = (e) => {
+  const button = e?.e?.button;
+  return panKeyPressed || button === 1;
+};
+
+const handleCanvasPanStart = (e) => {
+  if (!canvas) return false;
+  if (!shouldStartPan(e)) return false;
+
+  isPanning = true;
+  setPanMode(true);
+
+  lastPanClientX = e.e.clientX;
+  lastPanClientY = e.e.clientY;
+  canvas.setCursor('grabbing');
+
+  return true;
+};
+
+const handleCanvasPanMove = (e) => {
+  if (!canvas) return false;
+  if (!isPanning) return false;
+  if (!e || !e.e) return true;
+
+  const dx = e.e.clientX - lastPanClientX;
+  const dy = e.e.clientY - lastPanClientY;
+  lastPanClientX = e.e.clientX;
+  lastPanClientY = e.e.clientY;
+
+  const vpt = canvas.viewportTransform;
+  if (vpt) {
+    vpt[4] += dx;
+    vpt[5] += dy;
+    canvas.setViewportTransform(vpt);
+    canvas.requestRenderAll();
+    refreshRemoteCursors();
+  }
+
+  return true;
+};
+
+const handleCanvasPanEnd = () => {
+  if (!canvas) return;
+  if (!isPanning) return;
+
+  isPanning = false;
+  if (panKeyPressed) {
+    canvas.setCursor('grab');
+  } else {
+    setPanMode(false);
+    canvas.setCursor('default');
   }
 };
 
@@ -563,6 +1466,52 @@ const stopLocalDrawingOnce = () => {
 
 // --- 方法：处理键盘事件 (删除选中物体) ---
 const handleKeydown = (e) => {
+  // 如果当前焦点在输入框/可编辑区域，则不拦截快捷键（避免影响输入）
+  const target = e?.target;
+  const isEditable =
+    target &&
+    (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+  if (isEditable) return;
+
+  if (isFormulaRecognizeMode.value === true && e.key === 'Escape') {
+    e.preventDefault();
+    cancelFormulaRecognize();
+    return;
+  }
+
+  // 0. 处理视图快捷键（只影响本地视图）
+  // - Ctrl+0：复位视图
+  // - Ctrl+=：放大
+  // - Ctrl+-：缩小
+  if (e.ctrlKey || e.metaKey) {
+    if (e.key === '0') {
+      e.preventDefault();
+      resetView();
+      return;
+    }
+    if (e.key === '=' || e.key === '+') {
+      e.preventDefault();
+      zoomIn();
+      return;
+    }
+    if (e.key === '-') {
+      e.preventDefault();
+      zoomOut();
+      return;
+    }
+  }
+
+  // 0. 处理视图平移快捷键（按住空格）
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (!panKeyPressed) {
+      panKeyPressed = true;
+      setPanMode(true);
+      if (canvas) canvas.setCursor('grab');
+    }
+    return;
+  }
+
   // 1. 处理撤销 (Ctrl+Z)
   if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) { // 严格匹配 Ctrl+Z (不含 Shift)
     e.preventDefault();
@@ -635,6 +1584,9 @@ const handleKeydown = (e) => {
     if (activeObjects.length) {
       // 遍历删除
       activeObjects.forEach((obj) => {
+        if (obj && obj.id && isFormulaObject(obj) && obj.id === formulaEditingObjectId) {
+          void closeFormulaEditor(true);
+        }
         // 从画布移除
         canvas.remove(obj);
 
@@ -660,7 +1612,21 @@ const handleKeydown = (e) => {
       });
       canvas.discardActiveObject();
       canvas.requestRenderAll();
+      refreshSelectedFormula();
     }
+  }
+};
+
+/**
+ * 键盘抬起：用于结束“按住空格平移”的语义。
+ */
+const handleKeyup = (e) => {
+  if (e.code !== 'Space') return;
+
+  panKeyPressed = false;
+  if (!isPanning) {
+    setPanMode(false);
+    if (canvas) canvas.setCursor('default');
   }
 };
 
@@ -669,12 +1635,14 @@ const setTool = (tool) => {
   currentTool.value = tool;
   if (!canvas) return;
 
-  // 1. 处理绘图模式开关
-  if (tool === 'pencil') {
-    canvas.isDrawingMode = true; // 开启画笔
-  } else {
-    canvas.isDrawingMode = false; // 关闭画笔 (进入选择模式)
+  // 如果正在进行“视图平移”（空格按住或正在拖拽），先不切换交互模式；
+  // 等平移结束后，再由 applyToolMode 将最新工具状态应用到 Canvas。
+  if (panKeyPressed || isPanning) {
+    return;
   }
+
+  // 1. 处理绘图/选择模式开关
+  applyToolMode();
 
   // 2. 处理添加形状逻辑
   if (tool === 'rect') {
@@ -682,9 +1650,11 @@ const setTool = (tool) => {
     // 添加完后，自动切回选择模式，方便用户拖拽
     // 同时也更新 UI 状态
     currentTool.value = 'select';
+    applyToolMode();
   } else if (tool === 'circle') {
     addCircle();
     currentTool.value = 'select';
+    applyToolMode();
   }
 };
 
@@ -744,6 +1714,104 @@ const clearCanvas = () => {
   }
 };
 
+const resetRoom = () => {
+  if (confirm(`确定要重置房间「${ROOM_ID}」吗？所有人都会被清空，且会删除服务端保存的状态。`)) {
+    socketService.emit('clear-room', { roomId: ROOM_ID });
+  }
+};
+
+/**
+ * 在导出时临时隐藏“临时层对象”（如 Ghost Brush 预览线），避免导出的 PNG/JSON 里混入协同临时效果。
+ * 说明：
+ * - Ghost Polyline 会被添加到 canvas（便于显示），但不应作为“真实画布内容”保存；
+ * - 临时移除与恢复只发生在本地，且不会触发协同写入（object:added 已对 __isGhost 做了短路）。
+ */
+const withEphemeralObjectsHidden = (fn) => {
+  if (!canvas) return;
+
+  const ephemeralObjects = canvas
+    .getObjects()
+    .filter(obj => obj && (obj.__isGhost === true || obj.excludeFromExport === true));
+
+  ephemeralObjects.forEach(obj => canvas.remove(obj));
+
+  const activeObject = canvas.getActiveObject();
+  canvas.discardActiveObject();
+  canvas.requestRenderAll();
+
+  try {
+    return fn();
+  } finally {
+    ephemeralObjects.forEach(obj => canvas.add(obj));
+    if (activeObject && canvas.getObjects().includes(activeObject)) {
+      canvas.setActiveObject(activeObject);
+    }
+    canvas.requestRenderAll();
+  }
+};
+
+/**
+ * 触发浏览器下载：data URL 或 Blob。
+ */
+const triggerDownload = (filename, href) => {
+  const a = document.createElement('a');
+  a.href = href;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+};
+
+/**
+ * 导出当前视图为 PNG（等价于“截图”）。
+ * 说明：
+ * - 导出的是“当前缩放/平移后的视图区域”；
+ * - 若需要导出全量内容，可以在未来增加“导出全画布”的专用逻辑（基于对象边界计算）。
+ */
+const exportPng = () => {
+  if (!canvas) return;
+
+  withEphemeralObjectsHidden(() => {
+    const dataUrl = canvas.toDataURL({
+      format: 'png',
+      multiplier: 2
+    });
+    triggerDownload(`quickboard-${ROOM_ID}.png`, dataUrl);
+  });
+};
+
+/**
+ * 导出画布内容为 JSON（用于调试/存档）。
+ * 说明：
+ * - 导出的对象包含 id，便于后续回放或与 CRDT 状态对照；
+ * - 不导出临时对象（Ghost Brush）。
+ */
+const exportJson = () => {
+  if (!canvas) return;
+
+  withEphemeralObjectsHidden(() => {
+    const payload = {
+      meta: {
+        roomId: ROOM_ID,
+        exportedAt: new Date().toISOString(),
+        zoom: canvas.getZoom(),
+      },
+      canvas: canvas.toJSON(['id', 'excludeFromExport', '__isGhost'])
+    };
+
+    if (Array.isArray(payload.canvas.objects)) {
+      payload.canvas.objects = payload.canvas.objects.filter(
+        obj => !(obj && (obj.__isGhost === true || obj.excludeFromExport === true))
+      );
+    }
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    triggerDownload(`quickboard-${ROOM_ID}.json`, url);
+    URL.revokeObjectURL(url);
+  });
+};
+
 </script>
 
 <template>
@@ -781,16 +1849,93 @@ const clearCanvas = () => {
         ⭕ 圆形
       </button>
 
+      <button @click="insertFormula" class="p-2 rounded hover:bg-gray-100 transition" title="插入公式（LaTeX，编辑时上锁）">
+        ∑ 公式
+      </button>
+      <button
+        @click="startFormulaRecognize"
+        :disabled="isFormulaRecognizing"
+        class="p-2 rounded hover:bg-gray-100 transition disabled:opacity-50 disabled:cursor-not-allowed"
+        title="公式识别（框选手写区域 → 转 LaTeX）"
+      >
+        🔍 识别
+      </button>
+
       <div class="w-px h-8 bg-gray-200 mx-1"></div> <!-- 分隔线 -->
 
       <!-- 操作工具 -->
       <button @click="clearCanvas" class="p-2 rounded hover:bg-red-100 text-red-500 transition" title="清空画布">
         🗑️ 清空
       </button>
+      <button @click="resetRoom" class="p-2 rounded hover:bg-red-100 text-red-500 transition" title="重置房间">
+        ♻️ 重置
+      </button>
+
+      <div class="w-px h-8 bg-gray-200 mx-1"></div> <!-- 分隔线 -->
+
+      <!-- 导出工具 -->
+      <button @click="exportPng" class="p-2 rounded hover:bg-gray-100 transition" title="导出 PNG（当前视图）">
+        🖼️ PNG
+      </button>
+      <button @click="exportJson" class="p-2 rounded hover:bg-gray-100 transition" title="导出 JSON（画布对象）">
+        🧾 JSON
+      </button>
+      <button @click="resetView" class="p-2 rounded hover:bg-gray-100 transition" title="复位视图 (Ctrl+0 / 双击画布)">
+        🧭 复位
+      </button>
+
+      <div class="w-px h-8 bg-gray-200 mx-1"></div> <!-- 分隔线 -->
+
+      <!-- 房间工具：分享链接 / 切换房间 -->
+      <button @click="copyRoomLink" class="p-2 rounded hover:bg-gray-100 transition" title="复制房间链接">
+        🔗 分享
+      </button>
+      <input
+        v-model="roomIdInput"
+        class="h-9 w-32 px-2 rounded border border-gray-200 text-sm"
+        placeholder="room id"
+        title="输入房间号并回车/点击进入"
+        @keydown.enter="goToRoom"
+      />
+      <button @click="goToRoom" class="p-2 rounded hover:bg-gray-100 transition" title="进入房间（会刷新页面）">
+        ↩️ 进入
+      </button>
       <!-- 连接状态指示器 -->
       <div
         class="absolute bottom-4 right-4 bg-white/80 backdrop-blur px-3 py-1 rounded-full text-xs text-gray-500 shadow-sm border border-gray-200">
-        Room: demo-room 🟢 Connected
+        Room: {{ ROOM_ID }}
+        <span v-if="connectionState === 'connected'">🟢 Connected</span>
+        <span v-else-if="connectionState === 'connecting'">🟡 Connecting</span>
+        <span v-else>🔴 Disconnected</span>
+        <div v-if="selectedFormulaLockLabel" class="mt-0.5 text-[10px] text-gray-600">
+          {{ selectedFormulaLockLabel }}
+        </div>
+        <div v-if="formulaRecognizeHint" class="mt-0.5 text-[10px] text-gray-600">
+          {{ formulaRecognizeHint }}
+        </div>
+      </div>
+    </div>
+
+    <div v-if="isFormulaEditorOpen" class="absolute inset-0 bg-black/30 flex items-center justify-center pointer-events-auto">
+      <div class="w-[min(720px,92vw)] bg-white rounded-lg shadow-xl border border-gray-200 p-4">
+        <div class="text-sm font-medium text-gray-700 mb-2">编辑公式（LaTeX）</div>
+        <textarea
+          v-model="formulaEditorValue"
+          class="w-full h-40 p-2 border border-gray-200 rounded text-sm font-mono outline-none focus:ring-2 focus:ring-blue-200"
+          placeholder="例如：\\frac{a}{b} + \\sqrt{x}"
+        />
+        <div class="mt-3 rounded border border-gray-200 bg-gray-50 p-3 overflow-auto max-h-56">
+          <div v-if="formulaPreviewHtml" v-html="formulaPreviewHtml" />
+          <div v-else class="text-xs text-gray-400">输入 LaTeX 后显示预览</div>
+        </div>
+        <div class="mt-3 flex justify-end gap-2">
+          <button @click="closeFormulaEditor(true)" class="px-3 py-1.5 rounded border border-gray-200 hover:bg-gray-50 text-sm">
+            取消
+          </button>
+          <button @click="saveFormulaEditor" class="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm">
+            保存
+          </button>
+        </div>
       </div>
     </div>
   </div>

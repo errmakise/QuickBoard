@@ -170,6 +170,20 @@ export class CRDTManager {
     lww.set('_deleted', true, newTime);
     return lww.toJSON();
   }
+
+  /**
+   * 全量重置 CRDT 状态。
+   * 用途：
+   * - 配合“房间重置 (Reset Room)”：当服务端声明该房间被重置时，客户端必须丢弃本地所有 CRDT 记录（含 tombstone）。
+   *
+   * 注意：
+   * - 该操作会清空 objects 并将逻辑时钟归零；
+   * - 重置后，下一次本地操作从低时间戳重新开始，因此只能在“房间全员同时清空”的语义下使用。
+   */
+  reset() {
+    this.objects.clear();
+    logicalClock.reset(0);
+  }
 }
 
 // 导出单例，方便全局使用

@@ -1,50 +1,24 @@
-# QuickBoard
+# QuickBoard（Frontend）
 
-This template should help get you started developing with Vue 3 in Vite.
+## 端口约定
+- 前端（Vite）：`http://127.0.0.1:5173`
+- 后端（API + Socket）：`http://127.0.0.1:3000`
 
-## Recommended IDE Setup
+前端通过环境变量 `VITE_API_URL` 指向后端（默认建议 `http://127.0.0.1:3000`），白板的公式识别等能力由后端再转发到 OCR 服务。
 
-[VS Code](https://code.visualstudio.com/) + [Vue (Official)](https://marketplace.visualstudio.com/items?itemName=Vue.volar) (and disable Vetur).
-
-## Recommended Browser Setup
-
-- Chromium-based browsers (Chrome, Edge, Brave, etc.):
-  - [Vue.js devtools](https://chromewebstore.google.com/detail/vuejs-devtools/nhdogjmejiglipccpnnnanhbledajbpd) 
-  - [Turn on Custom Object Formatter in Chrome DevTools](http://bit.ly/object-formatters)
-- Firefox:
-  - [Vue.js devtools](https://addons.mozilla.org/en-US/firefox/addon/vue-js-devtools/)
-  - [Turn on Custom Object Formatter in Firefox DevTools](https://fxdx.dev/firefox-devtools-custom-object-formatters/)
-
-## Customize configuration
-
-See [Vite Configuration Reference](https://vite.dev/config/).
-
-## Project Setup
-
+## 开发运行
 ```sh
 npm install
+npm run dev -- --host 127.0.0.1 --port 5173 --strictPort
 ```
 
-### Compile and Hot-Reload for Development
-
-```sh
-npm run dev
-```
-
-### Compile and Minify for Production
-
+## 构建
 ```sh
 npm run build
 ```
 
-### Run Unit Tests with [Vitest](https://vitest.dev/)
-
+## 单测与规范
 ```sh
 npm run test:unit
-```
-
-### Lint with [ESLint](https://eslint.org/)
-
-```sh
 npm run lint
 ```
