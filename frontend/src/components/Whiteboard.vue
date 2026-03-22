@@ -18,9 +18,104 @@ const objectMap = new Map(); // id -> fabricObject (用于快速查找)
 // - disconnected: 连接断开（可能会自动重连）
 const connectionState = ref('connecting');
 
+// --- 同步版本号（用于断线重连后“只补缺失增量”）---
+//
+// 给外行看的解释：
+// - 服务端会维护一个“房间版本号”（serverVersion），每当它接受一次 draw-event 增量，就把版本号 +1；
+// - 客户端把“我目前同步到的版本号”记为 lastServerVersion；
+// - 断线重连后，join-room 会带上 clientVersion = lastServerVersion；
+// - 服务端如果还保留对应的增量日志，就回发 sync-delta（只包含缺失的那部分增量），速度会比发全量快照更快。
+//
+// 注意：
+// - 版本号只用于“补包定位”，不参与 CRDT/LWW 冲突裁决。
+let lastServerVersion = 0;
+let currentServerEpoch = '';
+
+const applyServerEpoch = (serverEpoch) => {
+  const next = typeof serverEpoch === 'string' ? serverEpoch.trim() : '';
+  if (!next) return;
+  if (currentServerEpoch && currentServerEpoch !== next) {
+    lastServerVersion = 0;
+    socketService.setClientVersion(0);
+  }
+  currentServerEpoch = next;
+};
+
+// --- 在线成员（成员列表 / 昵称展示）---
+//
+// 背景（给外行看的解释）：
+// - Socket.IO 每个连接都会分配一个 socketId（例如 "qv3..."），它能唯一标识“这次连接”；
+// - 但 socketId 对人不友好，所以我们让用户设置一个昵称（userName）；
+// - 进入房间时服务端会下发一次 room-users 快照，让 UI 立刻知道“现在房间里有哪些人”，
+//   而不需要等对方移动鼠标触发 cursor-move。
+//
+// 注意：
+// - mySocketId 可能会在重连后变化（新的连接 = 新 socketId），这是正常现象。
+const mySocketId = ref('');
+const onlineUsers = ref({}); // { [userId]: { userId, userName } }
+const onlineUsersCount = computed(() => Object.keys(onlineUsers.value || {}).length);
+const onlineUsersLabel = computed(() => {
+  const entries = Object.values(onlineUsers.value || {});
+  const myId = mySocketId.value;
+  const names = entries.map((u) => {
+    const rawName = u && typeof u.userName === 'string' ? u.userName.trim() : '';
+    const display = rawName || (u && u.userId ? String(u.userId).slice(0, 4) : '未知');
+    return u && u.userId && myId && u.userId === myId ? `${display}(我)` : display;
+  });
+  return names.join('、');
+});
+
 // --- 光标相关 ---
 const cursorMap = new Map(); // userId -> { element, x, y }
-const myName = 'User ' + Math.floor(Math.random() * 1000); // 随机生成我的名字
+//
+// 昵称策略（给外行看的解释）：
+// - 昵称只用于“展示身份”（光标标签/锁提示/成员列表），不影响 CRDT 数据正确性；
+// - 这里把昵称存在 localStorage，保证刷新页面后仍然是同一个名字；
+// - 同时把昵称同步给服务端，让其它用户能在 user-joined / user-left / user-name 等事件里看到名字。
+const NAME_STORAGE_KEY = 'qb:nickname';
+let initialName = '';
+try {
+  initialName = String(localStorage.getItem(NAME_STORAGE_KEY) || '').trim();
+} catch (e) {
+  initialName = '';
+}
+const myName = ref(initialName || `User ${Math.floor(Math.random() * 1000)}`);
+try {
+  if (!initialName) localStorage.setItem(NAME_STORAGE_KEY, myName.value);
+} catch (e) {
+}
+socketService.setUserName(myName.value);
+
+const upsertOnlineUser = (userId, userName) => {
+  if (!userId) return;
+  const next = { ...(onlineUsers.value || {}) };
+  const name = typeof userName === 'string' ? userName.trim() : '';
+  next[userId] = { userId, userName: name };
+  onlineUsers.value = next;
+};
+
+const removeOnlineUser = (userId) => {
+  if (!userId) return;
+  if (!onlineUsers.value || !onlineUsers.value[userId]) return;
+  const next = { ...(onlineUsers.value || {}) };
+  delete next[userId];
+  onlineUsers.value = next;
+};
+
+const saveMyName = async () => {
+  const next = String(myName.value || '').trim().slice(0, 24);
+  if (!next) return;
+  myName.value = next;
+  socketService.setUserName(next);
+  try {
+    localStorage.setItem(NAME_STORAGE_KEY, next);
+  } catch (e) {
+  }
+
+  // 通知服务端“我改名了”，避免必须等我移动鼠标（cursor-move）别人才看到新名字。
+  // 这里使用带 ack 的事件：如果离线，会返回 DISCONNECTED，我们直接忽略即可。
+  await socketService.emitWithAck('set-user-name', { userName: next }, 2000);
+};
 
 const lockState = ref({});
 const isFormulaEditorOpen = ref(false);
@@ -215,7 +310,7 @@ onMounted(() => {
         roomId: ROOM_ID,
         x: pointer.x,
         y: pointer.y,
-        userName: myName
+        userName: myName.value
       });
       lastCursorSend = now;
     }
@@ -443,13 +538,13 @@ const handleLockState = (payload) => {
 
 // --- 方法：Socket 初始化 ---
 const initSocket = () => {
-  // 连接后端服务器并加入房间
-  socketService.connect(ROOM_ID);
   connectionState.value = 'connecting';
 
   // Socket.IO 内部具备自动重连机制，这里只做状态映射用于 UI 告知用户“当前是否在线”
   socketService.on('connect', () => {
     connectionState.value = 'connected';
+    mySocketId.value = socketService.getSocketId();
+    upsertOnlineUser(mySocketId.value, myName.value);
     // 连接/重连成功后，清理上一次断线残留的“临时 UI 状态”（远程光标/ghost 预览线）
     // 原因：断线期间无法收到 user-left / drawing-end 等事件，可能导致本地残留“幽灵光标/幽灵线”。
     cleanupEphemeralState();
@@ -469,11 +564,30 @@ const initSocket = () => {
   // 监听：CRDT 远程更新
   socketService.on('draw-event', (crdtState) => {
     // console.log('📩 Received CRDT update:', crdtState);
+    if (crdtState && typeof crdtState.serverEpoch === 'string' && crdtState.serverEpoch) {
+      applyServerEpoch(crdtState.serverEpoch);
+    }
+    if (crdtState && typeof crdtState.serverVersion === 'number' && Number.isFinite(crdtState.serverVersion)) {
+      const sv = Math.floor(crdtState.serverVersion);
+      lastServerVersion = Math.max(lastServerVersion, sv);
+      socketService.setClientVersion(lastServerVersion);
+    }
     handleRemoteUpdate(crdtState);
   });
 
   // 监听：全量同步 (Initial Sync)
-  socketService.on('sync-state', (allObjects) => {
+  socketService.on('sync-state', (payload) => {
+    const allObjects = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.objects) ? payload.objects : []);
+    if (payload && typeof payload.serverEpoch === 'string' && payload.serverEpoch) {
+      applyServerEpoch(payload.serverEpoch);
+    }
+    const sv = payload && typeof payload.serverVersion === 'number' && Number.isFinite(payload.serverVersion)
+      ? Math.floor(payload.serverVersion)
+      : null;
+    if (typeof sv === 'number') {
+      lastServerVersion = currentServerEpoch ? Math.max(lastServerVersion, sv) : sv;
+      socketService.setClientVersion(lastServerVersion);
+    }
     console.log('📦 Received initial sync state:', allObjects.length, 'objects');
     // 初次同步/重连同步都是“服务端快照 + 后续增量”的模型：服务端只发存活对象，
     // 本地如果曾记录 tombstone（_deleted），不会因为快照缺少 _deleted 字段而被复活。
@@ -485,15 +599,63 @@ const initSocket = () => {
     });
   });
 
+  // 监听：断线重连后的“增量补包”
+  socketService.on('sync-delta', (payload) => {
+    if (!payload || payload.roomId !== ROOM_ID) return;
+    if (typeof payload.serverEpoch === 'string' && payload.serverEpoch) {
+      applyServerEpoch(payload.serverEpoch);
+    }
+    const deltas = Array.isArray(payload.deltas) ? payload.deltas : [];
+    deltas.forEach((d) => {
+      if (!d || !d.id) return;
+      const sv = typeof d.v === 'number' && Number.isFinite(d.v) ? Math.floor(d.v) : null;
+      if (typeof sv === 'number') {
+        lastServerVersion = Math.max(lastServerVersion, sv);
+        socketService.setClientVersion(lastServerVersion);
+      }
+      handleRemoteUpdate({ id: d.id, data: d.data, timestamps: d.timestamps });
+    });
+
+    const toV = typeof payload.toVersion === 'number' && Number.isFinite(payload.toVersion) ? Math.floor(payload.toVersion) : null;
+    if (typeof toV === 'number') {
+      lastServerVersion = Math.max(lastServerVersion, toV);
+      socketService.setClientVersion(lastServerVersion);
+    }
+  });
+
+  // 监听：房间在线成员快照
+  // - join-room 之后服务端会立刻 emit 一次 room-users，让新加入者能立刻看到成员列表
+  // - 这个快照不影响 CRDT，只用于 UI 展示（“谁在线、昵称是什么”）
+  socketService.on('room-users', (payload) => {
+    if (!payload || payload.roomId !== ROOM_ID) return;
+    const arr = Array.isArray(payload.users) ? payload.users : [];
+    const next = {};
+    arr.forEach((u) => {
+      if (!u || !u.userId) return;
+      next[u.userId] = { userId: u.userId, userName: u.userName || '' };
+    });
+    onlineUsers.value = next;
+  });
+
+  // 监听：用户改名
+  socketService.on('user-name', (data) => {
+    if (!data || !data.userId) return;
+    upsertOnlineUser(data.userId, data.userName || '');
+  });
+
   // 监听：用户加入
   socketService.on('user-joined', (data) => {
-    console.log('👋 User joined:', data.userId);
+    if (!data || !data.userId) return;
+    upsertOnlineUser(data.userId, data.userName || '');
   });
 
   // 监听：光标移动
   socketService.on('cursor-move', (data) => {
     // console.log('🖱️ Cursor move:', data.userId, data.x, data.y); // 调试日志
     updateRemoteCursor(data);
+    if (data && data.userId) {
+      upsertOnlineUser(data.userId, data.userName || '');
+    }
   });
 
   // 监听：实时绘图 (Ghost Brush)
@@ -504,7 +666,9 @@ const initSocket = () => {
 
   // 监听：用户离开
   socketService.on('user-left', (data) => {
+    if (!data || !data.userId) return;
     removeRemoteCursor(data.userId);
+    removeOnlineUser(data.userId);
   });
 
   socketService.on('room-cleared', (data) => {
@@ -515,6 +679,9 @@ const initSocket = () => {
   socketService.on('lock-state', (payload) => {
     handleLockState(payload);
   });
+
+  // 连接后端服务器并加入房间
+  socketService.connect({ roomId: ROOM_ID, userName: myName.value });
 };
 
 /**
@@ -524,6 +691,8 @@ const initSocket = () => {
  * - 该操作可能来自本地点击，也可能来自远端广播，逻辑应完全一致
  */
 const applyRoomClear = () => {
+  lastServerVersion = 0;
+  socketService.setClientVersion(0);
   lockState.value = {};
   selectedFormulaObjectId.value = null;
   void closeFormulaEditor(true);
@@ -952,7 +1121,7 @@ const openFormulaEditor = async (obj) => {
   const resp = await socketService.acquireLock({
     roomId: ROOM_ID,
     resourceId,
-    ownerName: myName,
+    ownerName: myName.value,
     ttlMs: 15000
   });
 
@@ -1110,6 +1279,15 @@ const updateRemoteCursor = ({ userId, x, y, userName }) => {
     } else {
       return;
     }
+  }
+
+  // 光标标签（昵称）需要可更新：
+  // - 初次创建时会写入 userName；
+  // - 但如果用户中途修改昵称（user-name 事件），或者 cursor-move 带了新名字，
+  //   我们希望不用等“光标重建”也能更新文字。
+  const span = cursor && cursor.el ? cursor.el.querySelector('span') : null;
+  if (span) {
+    span.textContent = userName || userId.slice(0, 4);
   }
 
   // 存储远端光标的“世界坐标（canvas 坐标）”，在视图平移/缩放时可用来重新计算屏幕位置
@@ -1838,7 +2016,7 @@ const exportJson = () => {
         ✏️ 画笔
       </button>
 
-      <div class="w-px h-8 bg-gray-200 mx-1"></div> <!-- 分隔线 -->
+      <div class="w-px h-8 bg-gray-200 mx-1"></div>
 
       <!-- 形状工具 -->
       <button @click="setTool('rect')" class="p-2 rounded hover:bg-gray-100 transition" title="添加矩形">
@@ -1861,7 +2039,7 @@ const exportJson = () => {
         🔍 识别
       </button>
 
-      <div class="w-px h-8 bg-gray-200 mx-1"></div> <!-- 分隔线 -->
+      <div class="w-px h-8 bg-gray-200 mx-1"></div>
 
       <!-- 操作工具 -->
       <button @click="clearCanvas" class="p-2 rounded hover:bg-red-100 text-red-500 transition" title="清空画布">
@@ -1886,6 +2064,17 @@ const exportJson = () => {
 
       <div class="w-px h-8 bg-gray-200 mx-1"></div> <!-- 分隔线 -->
 
+      <input
+        v-model="myName"
+        class="h-9 w-28 px-2 rounded border border-gray-200 text-sm"
+        placeholder="昵称"
+        title="设置昵称（本地保存）"
+        @keydown.enter="saveMyName"
+        @blur="saveMyName"
+      />
+
+      <div class="w-px h-8 bg-gray-200 mx-1"></div>
+
       <!-- 房间工具：分享链接 / 切换房间 -->
       <button @click="copyRoomLink" class="p-2 rounded hover:bg-gray-100 transition" title="复制房间链接">
         🔗 分享
@@ -1907,6 +2096,9 @@ const exportJson = () => {
         <span v-if="connectionState === 'connected'">🟢 Connected</span>
         <span v-else-if="connectionState === 'connecting'">🟡 Connecting</span>
         <span v-else>🔴 Disconnected</span>
+        <div v-if="onlineUsersCount" class="mt-0.5 text-[10px] text-gray-600" :title="onlineUsersLabel">
+          在线：{{ onlineUsersCount }}人
+        </div>
         <div v-if="selectedFormulaLockLabel" class="mt-0.5 text-[10px] text-gray-600">
           {{ selectedFormulaLockLabel }}
         </div>

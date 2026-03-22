@@ -50,7 +50,7 @@ def main():
     print("\n=== 切换完成 ===")
     print("现在可以重新启动 OCR 服务了:")
     print(f"cd {ocr_dir}")
-    print("python -m uvicorn app:app --host 127.0.0.1 --port 5005")
+    print("python -m uvicorn app:app --host 127.0.0.1 --port 5007")
     
     return True
 
