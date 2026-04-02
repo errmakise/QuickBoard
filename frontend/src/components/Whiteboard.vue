@@ -17,6 +17,232 @@ const objectMap = new Map(); // id -> fabricObject (用于快速查找)
 // - connected: 连接已建立
 // - disconnected: 连接断开（可能会自动重连）
 const connectionState = ref('connecting');
+const isOnline = computed(() => connectionState.value === 'connected');
+
+const viewportWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1200);
+
+const TOOLBAR_STORAGE_KEY = 'qb:toolbarExpanded';
+let toolbarExpandedInit = false;
+try {
+  const raw = String(localStorage.getItem(TOOLBAR_STORAGE_KEY) || '').trim();
+  if (raw) toolbarExpandedInit = raw === '1' || raw.toLowerCase() === 'true';
+} catch {
+  toolbarExpandedInit = false;
+}
+const toolbarExpanded = ref(toolbarExpandedInit);
+const toolbarCompact = computed(() => viewportWidth.value < 980);
+const toolbarShowAdvanced = computed(() => toolbarExpanded.value);
+
+const toggleToolbarExpanded = () => {
+  toolbarExpanded.value = !toolbarExpanded.value;
+  try {
+    localStorage.setItem(TOOLBAR_STORAGE_KEY, toolbarExpanded.value ? '1' : '0');
+  } catch {
+    void 0;
+  }
+};
+
+const toolbarBtnBase =
+  'h-9 px-2 rounded-md text-sm inline-flex items-center gap-1.5 hover:bg-gray-100 active:scale-[0.98] transition select-none';
+const toolbarBtnActive = 'bg-blue-50 text-blue-700 ring-1 ring-blue-200';
+const toolbarBtnDanger = 'text-red-600 hover:bg-red-50';
+const toolbarBtnMuted = 'text-gray-700';
+const toolbarBtnDisabled = 'disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100';
+const toolBtnClass = (tool) => {
+  const isActive = currentTool.value === tool;
+  return `${toolbarBtnBase} ${toolbarBtnMuted} ${isActive ? toolbarBtnActive : ''}`;
+};
+const simpleBtnClass = () => `${toolbarBtnBase} ${toolbarBtnMuted}`;
+const dangerBtnClass = () => `${toolbarBtnBase} ${toolbarBtnDanger}`;
+const dangerBtnDisabledClass = () => `${toolbarBtnBase} ${toolbarBtnDanger} ${toolbarBtnDisabled}`;
+const simpleBtnDisabledClass = () => `${toolbarBtnBase} ${toolbarBtnMuted} ${toolbarBtnDisabled}`;
+
+const svgToBase64 = (svg) => {
+  try {
+    const enc = new TextEncoder();
+    const bytes = enc.encode(String(svg || ''));
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  } catch {
+    try {
+      return btoa(unescape(encodeURIComponent(String(svg || ''))));
+    } catch {
+      return '';
+    }
+  }
+};
+
+const svgToCursor = (svg, hotX, hotY, fallback) => {
+  const b64 = svgToBase64(svg);
+  const safeFallback = String(fallback || 'crosshair');
+  if (b64) return `url("data:image/svg+xml;base64,${b64}") ${hotX} ${hotY}, ${safeFallback}`;
+  return `url("data:image/svg+xml,${encodeURIComponent(String(svg || ''))}") ${hotX} ${hotY}, ${safeFallback}`;
+};
+
+const QB_CURSOR_PRECISE = (() => {
+  const svg = "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><circle cx='12' cy='12' r='7.6' fill='none' stroke='%23ffffff' stroke-opacity='0.96' stroke-width='3.2'/><circle cx='12' cy='12' r='7.6' fill='none' stroke='%230f172a' stroke-opacity='0.92' stroke-width='1.8'/><circle cx='12' cy='12' r='2.2' fill='%23ffffff' fill-opacity='0.98'/><circle cx='12' cy='12' r='1.2' fill='%230f172a' fill-opacity='0.96'/></svg>";
+  return svgToCursor(svg, 12, 12, 'crosshair');
+})();
+
+const QB_CURSOR_ERASER = (() => {
+  const svg = "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><path d='M6 15l7-7 5 5-7 7H6l-2-2z' fill='none' stroke='%23ffffff' stroke-opacity='0.96' stroke-width='3.2' stroke-linejoin='round'/><path d='M6 15l7-7 5 5-7 7H6l-2-2z' fill='none' stroke='%230f172a' stroke-opacity='0.92' stroke-width='1.8' stroke-linejoin='round'/><path d='M12 20h10' stroke='%23ffffff' stroke-opacity='0.96' stroke-width='3.0' stroke-linecap='round'/><path d='M12 20h10' stroke='%230f172a' stroke-opacity='0.92' stroke-width='1.6' stroke-linecap='round'/></svg>";
+  return svgToCursor(svg, 12, 12, 'crosshair');
+})();
+
+const setCanvasCursor = (cursor) => {
+  if (!canvas) return;
+  const c = String(cursor || 'default');
+  canvas.defaultCursor = c;
+  canvas.hoverCursor = c;
+  canvas.moveCursor = c;
+  if (canvas.upperCanvasEl && canvas.upperCanvasEl.style) {
+    canvas.upperCanvasEl.style.cursor = c;
+  }
+};
+
+let eraserHoverCursorBackup = null;
+const applyEraserHoverCursorOverride = (enabled) => {
+  if (!canvas) return;
+  if (enabled === true) {
+    if (!eraserHoverCursorBackup) eraserHoverCursorBackup = new WeakMap();
+    const objs = canvas.getObjects ? canvas.getObjects() : [];
+    (objs || []).forEach((obj) => {
+      if (!obj || obj.__isGhost === true) return;
+      if (eraserHoverCursorBackup && !eraserHoverCursorBackup.has(obj)) {
+        eraserHoverCursorBackup.set(obj, obj.hoverCursor);
+      }
+      obj.hoverCursor = QB_CURSOR_ERASER;
+      obj.moveCursor = QB_CURSOR_ERASER;
+    });
+    return;
+  }
+
+  if (!eraserHoverCursorBackup) return;
+  const objs = canvas.getObjects ? canvas.getObjects() : [];
+  (objs || []).forEach((obj) => {
+    if (!obj) return;
+    const prev = eraserHoverCursorBackup.get(obj);
+    if (prev !== undefined) obj.hoverCursor = prev;
+    if (prev !== undefined) obj.moveCursor = prev;
+  });
+};
+
+// --- 弱网模拟（开发验证入口）---
+//
+// 给外行看的解释：
+// - “弱网”不是指你电脑坏了，而是指：网络延迟高、偶发丢包、消息顺序乱；
+// - 协作白板要想稳定，必须能在这种情况下依然“最终收敛一致”；
+// - 我们把弱网模拟放在 socketService 里（对发送/接收做延迟与丢弃），这里仅负责：
+//   - 初始化配置（从 URL/localStorage 读取）
+//   - 在 UI 角落显示“当前是否开启弱网模拟 + 关键参数 + 统计”
+const netSimConfig = ref(socketService.getNetworkSimulation());
+const netSimStats = ref(socketService.getNetworkSimulationStats());
+const netSimEnabled = computed(() => !!netSimConfig.value && netSimConfig.value.enabled === true);
+const netSimLabel = computed(() => {
+  const cfg = netSimConfig.value || {};
+  const s = cfg.send || {};
+  const r = cfg.receive || {};
+  const pct = (x) => `${Math.round((Number(x) || 0) * 100)}%`;
+  const ms = (x) => `${Math.round(Number(x) || 0)}ms`;
+  return `S drop ${pct(s.dropRate)} delay ${ms(s.delayMs)}±${ms(s.jitterMs)} | R drop ${pct(r.dropRate)} delay ${ms(r.delayMs)}±${ms(r.jitterMs)}`;
+});
+const netSimTooltip = computed(() => {
+  const st = netSimStats.value || {};
+  return `send=${st.sendTotal} drop=${st.sendDropped} delayed=${st.sendDelayed} (lastDelay=${st.lastSendDelayMs}ms)\nrecv=${st.recvTotal} drop=${st.recvDropped} delayed=${st.recvDelayed} (lastDelay=${st.lastRecvDelayMs}ms)`;
+});
+let netSimPollTimer = null;
+
+const toolRingMounted = ref(false);
+const toolRingVisible = ref(false);
+const toolRingX = ref(-10000);
+const toolRingY = ref(-10000);
+const toolRingOpenSeq = ref(0);
+const toolRingHoverKey = ref('');
+let toolRingAutoCloseTimer = null;
+let toolRingLongPressTimer = null;
+let toolRingLongPressStart = null;
+let toolRingActivePointerId = null;
+let toolRingHostEl = null;
+let toolRingDetach = null;
+
+const eraserCursorClientX = ref(-10000);
+const eraserCursorClientY = ref(-10000);
+
+let shapeDraft = null;
+
+// --- 轻量 Toast（非阻塞提示）---
+//
+// 给外行看的解释：
+// - 浏览器原生的 alert/confirm 会“阻塞页面”（用户必须点确定/取消才能继续操作），体验很差；
+// - 协作白板是高频交互场景，我们更需要“非打断式提醒”（例如：复制成功/离线提示/识别失败原因）；
+// - 所以这里实现一个最小的 Toast：显示在右上角，几秒后自动消失。
+//
+// 设计原则：
+// - Toast 只用于“提示信息”，不承载关键业务输入（关键输入用弹窗/表单）；
+// - 默认自动消失；错误类可以更久一些；
+// - 不依赖第三方库，便于毕设答辩时讲清楚。
+const toasts = ref([]); // [{ id, type, message }]
+let toastSeq = 0;
+const pushToast = (type, message, ttlMs) => {
+  const id = `t${Date.now()}_${toastSeq++}`;
+  const msg = String(message || '').trim();
+  if (!msg) return;
+  const safeType = type === 'error' || type === 'warning' || type === 'success' ? type : 'info';
+  const defaultTtl = safeType === 'error' ? 4500 : safeType === 'warning' ? 3500 : 2200;
+  const ttl = Number.isFinite(ttlMs) ? Math.max(800, Math.min(15000, ttlMs)) : defaultTtl;
+  toasts.value = [...(toasts.value || []), { id, type: safeType, message: msg }];
+  setTimeout(() => {
+    toasts.value = (toasts.value || []).filter(t => t && t.id !== id);
+  }, ttl);
+};
+
+// --- 轻量确认弹窗（替代 confirm）---
+//
+// 给外行看的解释：
+// - confirm 同样会阻塞 UI，而且在移动端体验更差；
+// - 这里用一个简单的模态框来确认“危险操作”（清空画布、重置房间）。
+const confirmOpen = ref(false);
+const confirmTitle = ref('');
+const confirmMessage = ref('');
+const confirmOkText = ref('确定');
+const confirmCancelText = ref('取消');
+let confirmResolver = null;
+const confirmAsync = (title, message, okText, cancelText) => {
+  confirmTitle.value = String(title || '').trim() || '请确认';
+  confirmMessage.value = String(message || '').trim();
+  confirmOkText.value = String(okText || '').trim() || '确定';
+  confirmCancelText.value = String(cancelText || '').trim() || '取消';
+  confirmOpen.value = true;
+  return new Promise((resolve) => {
+    confirmResolver = resolve;
+  });
+};
+const closeConfirm = (result) => {
+  confirmOpen.value = false;
+  const r = confirmResolver;
+  confirmResolver = null;
+  if (typeof r === 'function') r(result === true);
+};
+
+// --- 手动复制弹窗（用于剪贴板 API 失败时的兜底）---
+const manualCopyOpen = ref(false);
+const manualCopyText = ref('');
+const openManualCopy = (text) => {
+  manualCopyText.value = String(text || '');
+  manualCopyOpen.value = true;
+};
+const closeManualCopy = () => {
+  manualCopyOpen.value = false;
+};
+
+const helpOpen = ref(false);
+const openHelp = () => {
+  helpOpen.value = true;
+};
+const closeHelp = () => {
+  helpOpen.value = false;
+};
 
 // --- 同步版本号（用于断线重连后“只补缺失增量”）---
 //
@@ -30,6 +256,19 @@ const connectionState = ref('connecting');
 // - 版本号只用于“补包定位”，不参与 CRDT/LWW 冲突裁决。
 let lastServerVersion = 0;
 let currentServerEpoch = '';
+const lastSyncError = ref('');
+const lastSyncAt = ref(0);
+const canRequestSync = computed(() => connectionState.value === 'connected');
+const syncErrorLabel = computed(() => {
+  const code = String(lastSyncError.value || '').trim();
+  if (!code) return '';
+  if (code === 'DISCONNECTED') return '离线中（请等待重连后再对齐）';
+  if (code === 'TIMEOUT') return '请求超时（后端繁忙或网络不稳定）';
+  if (code === 'NOT_IN_ROOM') return '尚未加入房间（请刷新或重新进入房间）';
+  if (code === 'INVALID_ROOM') return '房间号无效';
+  if (code === 'NO_SOCKET') return '连接未初始化';
+  return `未知错误：${code}`;
+});
 
 const applyServerEpoch = (serverEpoch) => {
   const next = typeof serverEpoch === 'string' ? serverEpoch.trim() : '';
@@ -39,6 +278,28 @@ const applyServerEpoch = (serverEpoch) => {
     socketService.setClientVersion(0);
   }
   currentServerEpoch = next;
+};
+
+const requestFullSync = async () => {
+  lastSyncError.value = '';
+  if (!canRequestSync.value) {
+    lastSyncError.value = 'DISCONNECTED';
+    return;
+  }
+  const resp = await socketService.emitWithAck('request-sync', { roomId: ROOM_ID }, 3000);
+  if (!resp || resp.ok !== true) {
+    const code = resp && typeof resp.error === 'string' ? resp.error : 'SYNC_FAILED';
+    lastSyncError.value = code;
+    return;
+  }
+  if (resp && typeof resp.serverEpoch === 'string' && resp.serverEpoch) {
+    applyServerEpoch(resp.serverEpoch);
+  }
+  if (resp && typeof resp.serverVersion === 'number' && Number.isFinite(resp.serverVersion)) {
+    lastServerVersion = Math.max(lastServerVersion, Math.floor(resp.serverVersion));
+    socketService.setClientVersion(lastServerVersion);
+  }
+  lastSyncAt.value = Date.now();
 };
 
 // --- 在线成员（成员列表 / 昵称展示）---
@@ -67,6 +328,24 @@ const onlineUsersLabel = computed(() => {
 
 // --- 光标相关 ---
 const cursorMap = new Map(); // userId -> { element, x, y }
+
+const hashStringToHue = (s) => {
+  const str = String(s || '');
+  let h = 0;
+  for (let i = 0; i < str.length; i += 1) {
+    h = (h * 31 + str.charCodeAt(i)) % 360;
+  }
+  return h;
+};
+
+const getStableUserColor = (userId) => {
+  const hue = hashStringToHue(userId);
+  return {
+    solid: `hsl(${hue} 86% 52%)`,
+    soft: `hsla(${hue}, 86%, 52%, 0.22)`,
+    glow: `hsla(${hue}, 86%, 52%, 0.45)`
+  };
+};
 //
 // 昵称策略（给外行看的解释）：
 // - 昵称只用于“展示身份”（光标标签/锁提示/成员列表），不影响 CRDT 数据正确性；
@@ -76,13 +355,14 @@ const NAME_STORAGE_KEY = 'qb:nickname';
 let initialName = '';
 try {
   initialName = String(localStorage.getItem(NAME_STORAGE_KEY) || '').trim();
-} catch (e) {
+} catch {
   initialName = '';
 }
 const myName = ref(initialName || `User ${Math.floor(Math.random() * 1000)}`);
 try {
   if (!initialName) localStorage.setItem(NAME_STORAGE_KEY, myName.value);
-} catch (e) {
+} catch {
+  void 0;
 }
 socketService.setUserName(myName.value);
 
@@ -109,12 +389,434 @@ const saveMyName = async () => {
   socketService.setUserName(next);
   try {
     localStorage.setItem(NAME_STORAGE_KEY, next);
-  } catch (e) {
+  } catch {
+    void 0;
   }
 
   // 通知服务端“我改名了”，避免必须等我移动鼠标（cursor-move）别人才看到新名字。
   // 这里使用带 ack 的事件：如果离线，会返回 DISCONNECTED，我们直接忽略即可。
   await socketService.emitWithAck('set-user-name', { userName: next }, 2000);
+};
+
+const clearToolRingTimers = () => {
+  if (toolRingAutoCloseTimer) {
+    clearTimeout(toolRingAutoCloseTimer);
+    toolRingAutoCloseTimer = null;
+  }
+  if (toolRingLongPressTimer) {
+    clearTimeout(toolRingLongPressTimer);
+    toolRingLongPressTimer = null;
+  }
+  toolRingLongPressStart = null;
+};
+
+const scheduleToolRingAutoClose = () => {
+  if (toolRingAutoCloseTimer) clearTimeout(toolRingAutoCloseTimer);
+  toolRingAutoCloseTimer = setTimeout(() => {
+    toolRingVisible.value = false;
+    setTimeout(() => {
+      toolRingMounted.value = false;
+    }, 180);
+  }, 1000);
+};
+
+const openToolRingAtClientPoint = (clientX, clientY) => {
+  if (!toolRingHostEl || !toolRingHostEl.getBoundingClientRect) return;
+  if (isFormulaEditorOpen.value === true) return;
+  if (isFormulaRecognizeMode.value === true) return;
+  const rect = toolRingHostEl.getBoundingClientRect();
+  const x = Math.max(12, Math.min(rect.width - 12, clientX - rect.left));
+  const y = Math.max(12, Math.min(rect.height - 12, clientY - rect.top));
+  toolRingX.value = x;
+  toolRingY.value = y;
+  toolRingOpenSeq.value += 1;
+  toolRingHoverKey.value = '';
+  toolRingMounted.value = true;
+  toolRingVisible.value = false;
+  requestAnimationFrame(() => {
+    toolRingVisible.value = true;
+    scheduleToolRingAutoClose();
+  });
+};
+
+const closeToolRing = () => {
+  toolRingVisible.value = false;
+  toolRingHoverKey.value = '';
+  toolRingActivePointerId = null;
+  setTimeout(() => {
+    toolRingMounted.value = false;
+  }, 180);
+};
+
+const updateToolRingHoverByClientPoint = (clientX, clientY) => {
+  if (!toolRingVisible.value) return;
+  if (!toolRingHostEl || !toolRingHostEl.getBoundingClientRect) return;
+  const items = toolRingItems.value || [];
+  if (!items.length) return;
+
+  const rect = toolRingHostEl.getBoundingClientRect();
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
+  const dx = x - toolRingX.value;
+  const dy = y - toolRingY.value;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist < toolRingInnerRadius - 8 || dist > toolRingOuterRadius + 12) {
+    toolRingHoverKey.value = '';
+    return;
+  }
+
+  const angle = Math.atan2(dy, dx);
+  const total = items.length;
+  const step = (Math.PI * 2) / total;
+  const normalized = (angle + Math.PI / 2 + Math.PI * 2) % (Math.PI * 2);
+  const idx = Math.floor((normalized + step / 2) / step) % total;
+  const next = items[idx] && items[idx].key ? String(items[idx].key) : '';
+  toolRingHoverKey.value = next;
+};
+
+const performUndo = () => {
+  if (undoRedoInProgress) return;
+  undoRedoInProgress = true;
+  isUndoRedo = true;
+
+  if (canvas?.isDrawingMode) {
+    suppressNextLocalPathCreated = true;
+    if (suppressNextLocalPathCreatedTimeout) {
+      clearTimeout(suppressNextLocalPathCreatedTimeout);
+    }
+    suppressNextLocalPathCreatedTimeout = setTimeout(() => {
+      suppressNextLocalPathCreated = false;
+      suppressNextLocalPathCreatedTimeout = null;
+    }, 800);
+  }
+  stopLocalDrawingOnce();
+  historyManager.undo();
+
+  if (undoRedoTimeout) clearTimeout(undoRedoTimeout);
+  undoRedoTimeout = setTimeout(() => {
+    isUndoRedo = false;
+    undoRedoInProgress = false;
+  }, 100);
+};
+
+const performRedo = () => {
+  if (undoRedoInProgress) return;
+  undoRedoInProgress = true;
+  isUndoRedo = true;
+
+  historyManager.redo();
+
+  if (undoRedoTimeout) clearTimeout(undoRedoTimeout);
+  undoRedoTimeout = setTimeout(() => {
+    isUndoRedo = false;
+    undoRedoInProgress = false;
+  }, 100);
+};
+
+const finalizeNewObject = (obj) => {
+  if (!canvas || !obj) return;
+  if (!obj.id) {
+    obj.id = generateId();
+  }
+  objectMap.set(obj.id, obj);
+  historyManager.push(new AddCommand(getAppContext(), obj));
+  const crdtState = crdtManager.localUpdate(obj.id, obj.toJSON());
+  socketService.emit('draw-event', {
+    roomId: ROOM_ID,
+    ...crdtState
+  });
+};
+
+const beginShapeDraft = (shapeType, startPoint) => {
+  if (!canvas || !startPoint) return;
+  if (shapeDraft) return;
+
+  const x = startPoint.x;
+  const y = startPoint.y;
+  const baseStroke = 'rgba(15, 23, 42, 0.92)';
+  const baseStrokeWidth = 3;
+
+  let obj = null;
+  if (shapeType === 'rect') {
+    obj = new fabric.Rect({
+      left: x,
+      top: y,
+      width: 1,
+      height: 1,
+      rx: 6,
+      ry: 6,
+      fill: 'rgba(255,255,255,0)',
+      stroke: baseStroke,
+      strokeWidth: baseStrokeWidth,
+      selectable: false,
+      evented: false,
+      hasControls: false,
+      hoverCursor: QB_CURSOR_PRECISE
+    });
+  } else if (shapeType === 'circle') {
+    obj = new fabric.Circle({
+      left: x,
+      top: y,
+      radius: 1,
+      originX: 'left',
+      originY: 'top',
+      fill: 'rgba(255,255,255,0)',
+      stroke: baseStroke,
+      strokeWidth: baseStrokeWidth,
+      selectable: false,
+      evented: false,
+      hasControls: false,
+      hoverCursor: QB_CURSOR_PRECISE
+    });
+  }
+
+  if (!obj) return;
+  obj.__draftShape = true;
+  canvas.add(obj);
+  canvas.requestRenderAll();
+
+  shapeDraft = {
+    type: shapeType,
+    startX: x,
+    startY: y,
+    obj
+  };
+};
+
+const updateShapeDraft = (point) => {
+  if (!canvas || !shapeDraft || !point) return;
+  const x0 = shapeDraft.startX;
+  const y0 = shapeDraft.startY;
+  const x1 = point.x;
+  const y1 = point.y;
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+
+  if (shapeDraft.type === 'rect') {
+    const left = Math.min(x0, x1);
+    const top = Math.min(y0, y1);
+    const w = Math.max(1, Math.abs(dx));
+    const h = Math.max(1, Math.abs(dy));
+    shapeDraft.obj.set({ left, top, width: w, height: h });
+    shapeDraft.obj.setCoords();
+    canvas.requestRenderAll();
+    return;
+  }
+
+  if (shapeDraft.type === 'circle') {
+    const size = Math.max(1, Math.max(Math.abs(dx), Math.abs(dy)));
+    const left = dx >= 0 ? x0 : x0 - size;
+    const top = dy >= 0 ? y0 : y0 - size;
+    const r = size / 2;
+    shapeDraft.obj.set({ left, top, radius: r, originX: 'left', originY: 'top' });
+    shapeDraft.obj.setCoords();
+    canvas.requestRenderAll();
+  }
+};
+
+const commitShapeDraft = () => {
+  if (!canvas || !shapeDraft) return;
+  const obj = shapeDraft.obj;
+  shapeDraft = null;
+
+  if (!obj) return;
+  const tooSmall =
+    (obj.type === 'rect' && ((obj.width || 0) < 6 || (obj.height || 0) < 6)) ||
+    (obj.type === 'circle' && ((obj.radius || 0) < 4));
+
+  if (tooSmall) {
+    canvas.remove(obj);
+    canvas.requestRenderAll();
+    return;
+  }
+
+  obj.__draftShape = false;
+  obj.selectable = true;
+  obj.evented = true;
+  obj.hasControls = true;
+  obj.hoverCursor = 'move';
+  obj.setCoords();
+
+  finalizeNewObject(obj);
+  canvas.setActiveObject(obj);
+  canvas.requestRenderAll();
+};
+
+const cancelShapeDraft = () => {
+  if (!canvas || !shapeDraft) return;
+  const obj = shapeDraft.obj;
+  shapeDraft = null;
+  if (obj) {
+    canvas.remove(obj);
+    canvas.requestRenderAll();
+  }
+};
+
+const toolRingItems = computed(() => {
+  const stroke = "fill='none' stroke='currentColor' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'";
+  return [
+    {
+      key: 'pencil',
+      label: '画笔',
+      iconSvg: `<path d='M4 20h4l10-10-4-4L4 16v4z' ${stroke}/><path d='M13 7l4 4' ${stroke}/>` ,
+      action: () => setTool('pencil')
+    },
+    {
+      key: 'eraser',
+      label: '橡皮',
+      iconSvg: `<path d='M6 14l6-6 6 6-4 4H10L6 14z' ${stroke}/><path d='M10 18h4' ${stroke}/><path d='M12 20h8' ${stroke}/>` ,
+      action: () => setTool('eraser')
+    },
+    {
+      key: 'rect',
+      label: '矩形',
+      iconSvg: `<rect x='6' y='6' width='12' height='12' rx='2' ${stroke}/>` ,
+      action: () => setTool('rect')
+    },
+    {
+      key: 'circle',
+      label: '圆形',
+      iconSvg: `<circle cx='12' cy='12' r='6' ${stroke}/>` ,
+      action: () => setTool('circle')
+    },
+    {
+      key: 'formula',
+      label: '公式',
+      iconSvg: `<path d='M18 4H6l7 8-7 8h12' ${stroke}/>` ,
+      action: () => insertFormula()
+    },
+    {
+      key: 'recognize',
+      label: '识别',
+      iconSvg: `<circle cx='11' cy='11' r='4' ${stroke}/><path d='M20 20l-4-4' ${stroke}/>` ,
+      action: () => startFormulaRecognize()
+    },
+    {
+      key: 'undo',
+      label: '撤销',
+      iconSvg: `<path d='M9 14l-4-4 4-4' ${stroke}/><path d='M5 10h9a5 5 0 1 1 0 10h-3' ${stroke}/>` ,
+      action: () => performUndo()
+    },
+    {
+      key: 'redo',
+      label: '重做',
+      iconSvg: `<path d='M15 14l4-4-4-4' ${stroke}/><path d='M19 10H10a5 5 0 1 0 0 10h3' ${stroke}/>` ,
+      action: () => performRedo()
+    }
+  ];
+});
+
+const getToolRingIconStyle = (idx, total, isActive) => {
+  const p = getToolRingSectorLabelPoint(idx, total);
+  const delay = toolRingVisible.value ? `${idx * 28}ms` : '0ms';
+  const enterScale = toolRingVisible.value ? 1 : 0.18;
+  const baseScale = 0.78;
+  const scale = baseScale * enterScale;
+  return {
+    opacity: toolRingVisible.value ? 1 : 0,
+    color: isActive ? 'rgba(15,23,42,0.96)' : 'rgba(15,23,42,0.86)',
+    transform: `translate(${p.x}px, ${p.y}px) scale(${scale}) translate(-12px, -12px)`,
+    transitionProperty: 'transform, opacity',
+    transitionDuration: '180ms',
+    transitionTimingFunction: 'cubic-bezier(0.2, 0.8, 0.2, 1)',
+    transitionDelay: delay
+  };
+};
+
+const toolRingHoverLabel = computed(() => {
+  const k = String(toolRingHoverKey.value || '');
+  if (!k) return '';
+  const items = toolRingItems.value || [];
+  const found = items.find((x) => x && x.key === k);
+  return found && typeof found.label === 'string' ? found.label : '';
+});
+
+const getToolRingItemStyle = (idx, total) => {
+  const radius = 84;
+  const step = (Math.PI * 2) / Math.max(1, total);
+  const a = -Math.PI / 2 + idx * step;
+  const dx = Math.cos(a) * radius;
+  const dy = Math.sin(a) * radius;
+  const delay = toolRingVisible.value ? `${idx * 42}ms` : '0ms';
+  const x = toolRingX.value;
+  const y = toolRingY.value;
+  const translate = toolRingVisible.value
+    ? `translate(${x}px, ${y}px) translate(${dx}px, ${dy}px)`
+    : `translate(${x}px, ${y}px) translate(0px, 0px)`;
+  const scale = toolRingVisible.value ? 1 : 0.35;
+  const opacity = toolRingVisible.value ? 1 : 0;
+  return {
+    transform: `${translate} translate(-50%, -50%) scale(${scale})`,
+    opacity,
+    transitionDelay: delay
+  };
+};
+
+const toolRingSize = 220;
+const toolRingCenter = toolRingSize / 2;
+const toolRingInnerRadius = 46;
+const toolRingOuterRadius = 104;
+
+const polarToPoint = (angle, radius) => {
+  return {
+    x: toolRingCenter + Math.cos(angle) * radius,
+    y: toolRingCenter + Math.sin(angle) * radius
+  };
+};
+
+const getToolRingSectorPath = (idx, total) => {
+  const step = (Math.PI * 2) / Math.max(1, total);
+  const start = -Math.PI / 2 + idx * step;
+  const end = start + step;
+
+  const o0 = polarToPoint(start, toolRingOuterRadius);
+  const o1 = polarToPoint(end, toolRingOuterRadius);
+  const i1 = polarToPoint(end, toolRingInnerRadius);
+  const i0 = polarToPoint(start, toolRingInnerRadius);
+
+  const largeArc = step > Math.PI ? 1 : 0;
+
+  return [
+    `M ${o0.x} ${o0.y}`,
+    `A ${toolRingOuterRadius} ${toolRingOuterRadius} 0 ${largeArc} 1 ${o1.x} ${o1.y}`,
+    `L ${i1.x} ${i1.y}`,
+    `A ${toolRingInnerRadius} ${toolRingInnerRadius} 0 ${largeArc} 0 ${i0.x} ${i0.y}`,
+    'Z'
+  ].join(' ');
+};
+
+const getToolRingSectorLabelPoint = (idx, total) => {
+  const step = (Math.PI * 2) / Math.max(1, total);
+  const mid = -Math.PI / 2 + idx * step + step / 2;
+  return polarToPoint(mid, (toolRingInnerRadius + toolRingOuterRadius) / 2);
+};
+
+const getToolRingSectorStyle = (idx) => {
+  const delay = toolRingVisible.value ? `${idx * 28}ms` : '0ms';
+  const scale = toolRingVisible.value ? 1 : 0.18;
+  const opacity = toolRingVisible.value ? 1 : 0;
+  return {
+    opacity,
+    transform: `scale(${scale})`,
+    transformOrigin: `${toolRingCenter}px ${toolRingCenter}px`,
+    transitionProperty: 'transform, opacity',
+    transitionDuration: '180ms',
+    transitionTimingFunction: 'cubic-bezier(0.2, 0.8, 0.2, 1)',
+    transitionDelay: delay
+  };
+};
+
+const clickToolRingItem = (item) => {
+  if (!item || typeof item.action !== 'function') return;
+  item.action();
+  closeToolRing();
+};
+
+const clickToolRingItemByKey = (key) => {
+  const items = toolRingItems.value || [];
+  const k = String(key || '');
+  const found = items.find((x) => x && x.key === k);
+  if (found) clickToolRingItem(found);
 };
 
 const lockState = ref({});
@@ -234,13 +936,20 @@ const getAppContext = () => ({
 // --- 生命周期：挂载 ---
 onMounted(() => {
   patchFabricSerialization();
+  netSimConfig.value = socketService.initNetworkSimulation();
+  netSimStats.value = socketService.getNetworkSimulationStats();
+  if (netSimConfig.value && netSimConfig.value.enabled === true) {
+    netSimPollTimer = setInterval(() => {
+      netSimStats.value = socketService.getNetworkSimulationStats();
+    }, 600);
+  }
 
   // 1. 初始化 Fabric Canvas
   const fabricCanvas = new fabric.Canvas(canvasEl.value, {
     isDrawingMode: true, // 默认开启自由绘图模式
     width: window.innerWidth,
     height: window.innerHeight,
-    backgroundColor: '#ffffff',
+    backgroundColor: 'rgba(255,255,255,0)',
   });
   canvas = fabricCanvas;
   if (isDev) {
@@ -252,6 +961,128 @@ onMounted(() => {
   brush.width = 5;
   brush.color = '#000000';
   canvas.freeDrawingBrush = brush;
+
+  toolRingHostEl = canvasEl.value && canvasEl.value.parentElement ? canvasEl.value.parentElement : null;
+  if (toolRingHostEl) {
+    const host = toolRingHostEl;
+
+    const onContextMenu = (e) => {
+      if (!e) return;
+      e.preventDefault();
+    };
+
+    const onPointerDown = (e) => {
+      if (!e) return;
+
+      if (e.pointerType === 'mouse' && e.button === 2) {
+        e.preventDefault();
+        e.stopPropagation();
+        clearToolRingTimers();
+        toolRingActivePointerId = e.pointerId;
+        if (typeof host.setPointerCapture === 'function') {
+          try {
+            host.setPointerCapture(e.pointerId);
+          } catch {
+            void 0;
+          }
+        }
+        openToolRingAtClientPoint(e.clientX, e.clientY);
+        updateToolRingHoverByClientPoint(e.clientX, e.clientY);
+        return;
+      }
+
+      if (e.pointerType === 'touch' && e.isPrimary === true) {
+        clearToolRingTimers();
+        toolRingLongPressStart = {
+          pointerId: e.pointerId,
+          x: e.clientX,
+          y: e.clientY
+        };
+        toolRingLongPressTimer = setTimeout(() => {
+          if (!toolRingLongPressStart) return;
+          toolRingActivePointerId = toolRingLongPressStart.pointerId;
+          if (typeof host.setPointerCapture === 'function') {
+            try {
+              host.setPointerCapture(toolRingActivePointerId);
+            } catch {
+              void 0;
+            }
+          }
+          openToolRingAtClientPoint(toolRingLongPressStart.x, toolRingLongPressStart.y);
+          updateToolRingHoverByClientPoint(toolRingLongPressStart.x, toolRingLongPressStart.y);
+        }, 420);
+      }
+    };
+
+    const onPointerMove = (e) => {
+      if (!e) return;
+      if (toolRingLongPressStart && e.pointerId === toolRingLongPressStart.pointerId) {
+        const dx = e.clientX - toolRingLongPressStart.x;
+        const dy = e.clientY - toolRingLongPressStart.y;
+        if (Math.sqrt(dx * dx + dy * dy) > 12) {
+          if (toolRingLongPressTimer) {
+            clearTimeout(toolRingLongPressTimer);
+            toolRingLongPressTimer = null;
+          }
+          toolRingLongPressStart = null;
+        }
+      }
+
+      if (toolRingActivePointerId != null && e.pointerId === toolRingActivePointerId) {
+        updateToolRingHoverByClientPoint(e.clientX, e.clientY);
+        scheduleToolRingAutoClose();
+      }
+    };
+
+    const onPointerUp = (e) => {
+      if (!e) return;
+      if (toolRingLongPressTimer) {
+        clearTimeout(toolRingLongPressTimer);
+        toolRingLongPressTimer = null;
+      }
+      toolRingLongPressStart = null;
+
+      if (toolRingActivePointerId != null && e.pointerId === toolRingActivePointerId) {
+        const key = toolRingHoverKey.value;
+        if (key) {
+          clickToolRingItemByKey(key);
+        } else {
+          closeToolRing();
+        }
+      }
+      toolRingActivePointerId = null;
+    };
+
+    const onPointerCancel = () => {
+      clearToolRingTimers();
+      toolRingActivePointerId = null;
+      closeToolRing();
+    };
+
+    const onDocContextMenu = (e) => {
+      if (!e) return;
+      if (toolRingActivePointerId != null || toolRingVisible.value === true) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+
+    host.addEventListener('contextmenu', onContextMenu, true);
+    document.addEventListener('contextmenu', onDocContextMenu, true);
+    host.addEventListener('pointerdown', onPointerDown, true);
+    host.addEventListener('pointermove', onPointerMove, true);
+    host.addEventListener('pointerup', onPointerUp, true);
+    host.addEventListener('pointercancel', onPointerCancel, true);
+
+    toolRingDetach = () => {
+      host.removeEventListener('contextmenu', onContextMenu, true);
+      document.removeEventListener('contextmenu', onDocContextMenu, true);
+      host.removeEventListener('pointerdown', onPointerDown, true);
+      host.removeEventListener('pointermove', onPointerMove, true);
+      host.removeEventListener('pointerup', onPointerUp, true);
+      host.removeEventListener('pointercancel', onPointerCancel, true);
+    };
+  }
 
   // 3. 监听窗口大小改变
   window.addEventListener('resize', handleResize);
@@ -297,6 +1128,18 @@ onMounted(() => {
       return;
     }
 
+    if (currentTool.value === 'eraser') {
+      if (e && e.e && typeof e.e.clientX === 'number') {
+        eraserCursorClientX.value = e.e.clientX;
+        eraserCursorClientY.value = e.e.clientY;
+      }
+      if (canvas && canvas.upperCanvasEl && canvas.upperCanvasEl.style) {
+        if (canvas.upperCanvasEl.style.cursor !== QB_CURSOR_ERASER) {
+          canvas.upperCanvasEl.style.cursor = QB_CURSOR_ERASER;
+        }
+      }
+    }
+
     // 节流发送 (Throttle)
     // 鼠标移动事件触发频率极高 (每秒60+次)，如果每次都发送 WebSocket 消息，会造成“网络风暴”
     // 所以我们限制发送频率，每 50ms (即每秒 20 次) 最多发送一次
@@ -332,6 +1175,37 @@ onMounted(() => {
 
   // 手动追踪鼠标按键状态
   canvas.on('mouse:down', (e) => {
+    if (e && e.e && typeof e.e.button === 'number' && e.e.button === 2) {
+      isMouseDown = false;
+      return;
+    }
+
+    if (currentTool.value === 'eraser') {
+      const target = e && e.target;
+      if (target && target.id && target.__isGhost !== true) {
+        canvas.discardActiveObject();
+        canvas.remove(target);
+        objectMap.delete(target.id);
+        historyManager.push(new RemoveCommand(getAppContext(), target));
+        const crdtState = crdtManager.delete(target.id);
+        if (crdtState) {
+          socketService.emit('draw-event', { roomId: ROOM_ID, ...crdtState });
+        }
+        canvas.requestRenderAll();
+      }
+      isMouseDown = false;
+      return;
+    }
+
+    if (currentTool.value === 'rect' || currentTool.value === 'circle') {
+      const p = e && e.scenePoint;
+      if (p) {
+        beginShapeDraft(currentTool.value, p);
+      }
+      isMouseDown = false;
+      return;
+    }
+
     isMouseDown = true;
     // 如果本次 mouse down 用于平移视图，则不认为“正在绘图按下”
     if (handleCanvasPanStart(e)) {
@@ -339,8 +1213,19 @@ onMounted(() => {
     }
   });
   canvas.on('mouse:up', (e) => {
+    if (currentTool.value === 'rect' || currentTool.value === 'circle') {
+      commitShapeDraft();
+      return;
+    }
     isMouseDown = false;
     handleCanvasPanEnd(e);
+  });
+
+  canvas.on('mouse:move', (e) => {
+    if (currentTool.value === 'rect' || currentTool.value === 'circle') {
+      const p = e && e.scenePoint;
+      if (p) updateShapeDraft(p);
+    }
   });
 
   canvas.on('mouse:down', handleFormulaRecognizeMouseDown);
@@ -415,6 +1300,9 @@ onMounted(() => {
     if (obj.__isGhost === true) {
       return;
     }
+    if (obj.__draftShape === true) {
+      return;
+    }
     // 避免将远程添加的对象误判为本地操作（由 handleRemoteUpdate 标记）
     if (obj.__fromRemote === true) {
       return;
@@ -422,6 +1310,15 @@ onMounted(() => {
     // 自由画笔路径改由 path:created 负责入栈/广播，避免双重入栈
     if (obj.type === 'path') {
       return;
+    }
+
+    if (currentTool.value === 'eraser') {
+      if (!eraserHoverCursorBackup) eraserHoverCursorBackup = new WeakMap();
+      if (!eraserHoverCursorBackup.has(obj)) {
+        eraserHoverCursorBackup.set(obj, obj.hoverCursor);
+      }
+      obj.hoverCursor = QB_CURSOR_ERASER;
+      obj.moveCursor = QB_CURSOR_ERASER;
     }
 
     // 1. 分配 ID (如果还没有)
@@ -514,6 +1411,15 @@ onUnmounted(() => {
   window.removeEventListener('resize', handleResize);
   window.removeEventListener('keydown', handleKeydown);
   window.removeEventListener('keyup', handleKeyup);
+  if (typeof toolRingDetach === 'function') {
+    toolRingDetach();
+    toolRingDetach = null;
+  }
+  clearToolRingTimers();
+  if (netSimPollTimer) {
+    clearInterval(netSimPollTimer);
+    netSimPollTimer = null;
+  }
   cancelFormulaRecognize();
   void closeFormulaEditor(true);
   if (canvas) canvas.dispose();
@@ -577,7 +1483,9 @@ const initSocket = () => {
 
   // 监听：全量同步 (Initial Sync)
   socketService.on('sync-state', (payload) => {
+    if (payload && typeof payload === 'object' && payload.roomId && payload.roomId !== ROOM_ID) return;
     const allObjects = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.objects) ? payload.objects : []);
+    const tombstones = payload && Array.isArray(payload.tombstones) ? payload.tombstones : [];
     if (payload && typeof payload.serverEpoch === 'string' && payload.serverEpoch) {
       applyServerEpoch(payload.serverEpoch);
     }
@@ -588,11 +1496,21 @@ const initSocket = () => {
       lastServerVersion = currentServerEpoch ? Math.max(lastServerVersion, sv) : sv;
       socketService.setClientVersion(lastServerVersion);
     }
-    console.log('📦 Received initial sync state:', allObjects.length, 'objects');
+    const reason = payload && typeof payload.reason === 'string' ? payload.reason : '';
+    console.log(
+      '📦 Received sync state:',
+      allObjects.length,
+      'objects,',
+      tombstones.length,
+      'tombstones',
+      reason ? `(reason=${reason})` : ''
+    );
     // 初次同步/重连同步都是“服务端快照 + 后续增量”的模型：服务端只发存活对象，
     // 本地如果曾记录 tombstone（_deleted），不会因为快照缺少 _deleted 字段而被复活。
-    // 遍历所有对象，逐个合并
-    allObjects.forEach(state => {
+    // 同时：为了让漏掉“删除事件”的客户端也能收敛，快照里还会包含 tombstones（只带 _deleted）。
+    // 遍历所有状态，逐个合并（先应用存活对象，再应用 tombstones，让删除在 LWW 里自然获胜）
+    const allStates = allObjects.concat(tombstones);
+    allStates.forEach(state => {
       // 由于 enlivenObjects 是异步的，为了保证顺序和性能，这里可以优化
       // 但 MVP 阶段逐个调用也无妨
       handleRemoteUpdate(state);
@@ -723,7 +1641,7 @@ const applyRoomClear = () => {
 
   if (canvas) {
     canvas.clear();
-    canvas.backgroundColor = '#ffffff';
+    canvas.backgroundColor = 'rgba(255,255,255,0)';
   }
 
   objectMap.clear();
@@ -761,9 +1679,29 @@ const copyRoomLink = async () => {
 
   try {
     await navigator.clipboard.writeText(link);
-    alert('已复制房间链接');
+    pushToast('success', '链接已复制，发给队友吧');
   } catch {
-    window.prompt('复制失败，请手动复制：', link);
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = link;
+      ta.setAttribute('readonly', 'true');
+      ta.style.position = 'fixed';
+      ta.style.top = '-9999px';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand && document.execCommand('copy');
+      ta.remove();
+      if (ok) {
+        pushToast('success', '链接已复制，发给队友吧');
+        return;
+      }
+    } catch {
+      void 0;
+    }
+    pushToast('warning', '自动复制失败，已打开手动复制');
+    openManualCopy(link);
   }
 };
 
@@ -821,8 +1759,8 @@ const applyFormulaRecognizeMode = (enabled) => {
     canvas.isDrawingMode = false;
     canvas.selection = false;
     canvas.skipTargetFind = true;
-    canvas.defaultCursor = 'crosshair';
-    canvas.hoverCursor = 'crosshair';
+    canvas.defaultCursor = QB_CURSOR_PRECISE;
+    canvas.hoverCursor = QB_CURSOR_PRECISE;
     canvas.requestRenderAll();
     return;
   }
@@ -852,6 +1790,10 @@ const cancelFormulaRecognize = () => {
 const startFormulaRecognize = () => {
   if (!canvas) return;
   if (isFormulaRecognizing.value) return;
+  if (!isOnline.value) {
+    pushToast('warning', '离线中：无法进行公式识别（需要后端服务）。', 4200);
+    return;
+  }
   if (panKeyPressed || isPanning) {
     panKeyPressed = false;
     isPanning = false;
@@ -929,7 +1871,7 @@ const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
     window.__ocrDebugLast = result.debug;
     if (!window.__ocrDebugHintShown) {
       window.__ocrDebugHintShown = true;
-      alert('已生成 OCR 调试图：按 F12 打开 Console，输入 window.__ocrDebugLast 查看。');
+      pushToast('info', '已生成 OCR 调试图：F12 打开 Console，输入 window.__ocrDebugLast 查看。', 4200);
     }
   }
 
@@ -942,22 +1884,24 @@ const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
     const status = typeof result?.status === 'number' ? result.status : null;
     const detail = typeof result?.detail === 'string' ? result.detail.trim() : '';
     if (err === 'NOT_CONFIGURED') {
-      alert('识别服务未配置。');
+      pushToast('error', '识别服务未配置。', 4500);
     } else if (err === 'NETWORK_ERROR') {
-      alert('识别失败：无法连接到后端（请确认后端已启动，且 VITE_API_URL 配置正确）。');
+      pushToast('error', '识别失败：无法连接到后端（请确认后端已启动，且 VITE_API_URL 配置正确）。', 5200);
     } else if (err === 'UPSTREAM_ERROR') {
-      alert(
-        `识别失败：本地识别服务不可用或返回错误${status ? `（HTTP ${status}）` : ''}${detail ? `：${detail}` : ''}。`
+      pushToast(
+        'error',
+        `识别失败：本地识别服务不可用或返回错误${status ? `（HTTP ${status}）` : ''}${detail ? `：${detail}` : ''}。`,
+        6500
       );
     } else if (err === 'EMPTY_LATEX') {
-      alert('识别失败：识别服务未返回 latex。');
+      pushToast('error', '识别失败：识别服务未返回 latex。', 4500);
     } else {
-      alert(`公式识别失败（${err}${status ? `, HTTP ${status}` : ''}），请重试或手动编辑。`);
+      pushToast('error', `公式识别失败（${err}${status ? `, HTTP ${status}` : ''}），请重试或手动编辑。`, 5200);
     }
     return;
   }
   if (!latex.trim()) {
-    alert('识别失败：返回的 LaTeX 为空，请重试或手动编辑。');
+    pushToast('error', '识别失败：返回的 LaTeX 为空，请重试或手动编辑。', 4500);
     return;
   }
 
@@ -1129,9 +2073,9 @@ const openFormulaEditor = async (obj) => {
     const lockedBy = resp && resp.lockedBy;
     if (lockedBy) {
       const name = lockedBy.ownerName || lockedBy.ownerId || '未知用户';
-      alert(`该公式正在被「${name}」编辑中，请稍后再试。`);
+      pushToast('warning', `该公式正在被「${name}」编辑中，请稍后再试。`, 4200);
     } else {
-      alert('当前无法进入公式编辑，请稍后重试。');
+      pushToast('error', '当前无法进入公式编辑，请稍后重试。', 4200);
     }
     return;
   }
@@ -1155,7 +2099,7 @@ const openFormulaEditor = async (obj) => {
     });
     if (!renewResp || renewResp.ok !== true) {
       await closeFormulaEditor(false);
-      alert('公式编辑锁已失效，已自动退出编辑。');
+      pushToast('warning', '公式编辑锁已失效，已自动退出编辑。', 4200);
     }
   }, 5000);
 };
@@ -1255,16 +2199,16 @@ const updateRemoteCursor = ({ userId, x, y, userName }) => {
     // 创建光标元素 (使用 HTML DOM 覆盖在 Canvas 上)
     const el = document.createElement('div');
     // 设置基础样式：绝对定位，不阻挡鼠标事件，过渡效果
-    el.className = 'absolute pointer-events-none transition-transform duration-100 ease-linear z-50 flex flex-col items-center';
+    el.className = 'qb-remote-cursor absolute pointer-events-none transition-transform duration-100 ease-linear z-50 flex flex-col items-center';
 
-    // 生成随机颜色 (或根据 userId 生成)
-    const userColor = '#' + userId.slice(0, 6);
+    const c = getStableUserColor(userId);
 
     el.innerHTML = `
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="filter: drop-shadow(0 2px 2px rgba(0,0,0,0.2));">
-        <path d="M5.65376 12.3673H5.46026L5.31717 12.4976L0.500002 16.8829L0.500002 1.19177L11.7841 12.3673H5.65376Z" fill="${userColor}" stroke="white" stroke-width="1.5"/>
+      <div class="qb-cursor-tail" style="width: 2px; height: 18px; border-radius: 999px; background: linear-gradient(to top, ${c.solid}, transparent); box-shadow: 0 0 16px ${c.glow};" />
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="filter: drop-shadow(0 4px 10px ${c.soft});">
+        <path d="M5.65376 12.3673H5.46026L5.31717 12.4976L0.500002 16.8829L0.500002 1.19177L11.7841 12.3673H5.65376Z" fill="${c.solid}" stroke="white" stroke-width="1.5"/>
       </svg>
-      <span class="text-white text-[10px] px-1.5 py-0.5 rounded-full shadow-sm mt-0.5 whitespace-nowrap" style="background-color: ${userColor};">${userName || userId.slice(0, 4)}</span>
+      <span class="text-white text-[10px] px-1.5 py-0.5 rounded-full shadow-sm mt-0.5 whitespace-nowrap" style="background: ${c.solid}; box-shadow: 0 0 18px ${c.soft};">${userName || userId.slice(0, 4)}</span>
     `;
 
     // 强制设置初始位置为 0,0，防止 translate 偏移错误
@@ -1434,6 +2378,7 @@ const handleRemoteUpdate = (crdtState) => {
 
 // --- (以下是之前的绘图逻辑，保持不变) ---
 const handleResize = () => {
+  viewportWidth.value = window.innerWidth;
   if (canvas) {
     canvas.setWidth(window.innerWidth);
     canvas.setHeight(window.innerHeight);
@@ -1449,12 +2394,47 @@ const applyToolMode = () => {
   if (!canvas) return;
 
   if (currentTool.value === 'pencil') {
+    applyEraserHoverCursorOverride(false);
     canvas.isDrawingMode = true;
     canvas.selection = false;
+    canvas.skipTargetFind = false;
+    setCanvasCursor(QB_CURSOR_PRECISE);
+    canvas.freeDrawingCursor = QB_CURSOR_PRECISE;
+    canvas.requestRenderAll();
+    return;
   } else {
     canvas.isDrawingMode = false;
     canvas.selection = true;
   }
+
+  if (currentTool.value === 'rect' || currentTool.value === 'circle') {
+    applyEraserHoverCursorOverride(false);
+    canvas.selection = false;
+    canvas.skipTargetFind = true;
+    setCanvasCursor(QB_CURSOR_PRECISE);
+    canvas.discardActiveObject();
+    canvas.requestRenderAll();
+    return;
+  }
+
+  if (currentTool.value === 'eraser') {
+    applyEraserHoverCursorOverride(true);
+    canvas.selection = false;
+    canvas.skipTargetFind = false;
+    setCanvasCursor(QB_CURSOR_ERASER);
+    canvas.discardActiveObject();
+    canvas.requestRenderAll();
+    return;
+  }
+
+  applyEraserHoverCursorOverride(false);
+  canvas.skipTargetFind = false;
+  canvas.defaultCursor = 'default';
+  canvas.hoverCursor = 'move';
+  if (canvas.upperCanvasEl && canvas.upperCanvasEl.style) {
+    canvas.upperCanvasEl.style.cursor = 'default';
+  }
+  canvas.requestRenderAll();
 };
 
 /**
@@ -1651,9 +2631,63 @@ const handleKeydown = (e) => {
     (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
   if (isEditable) return;
 
+  if (helpOpen.value && e.key === 'Escape') {
+    e.preventDefault();
+    helpOpen.value = false;
+    return;
+  }
+
+  if (toolRingVisible.value && e.key === 'Escape') {
+    e.preventDefault();
+    closeToolRing();
+    return;
+  }
+
+  if (e.key === '?' || (e.shiftKey && e.key === '/')) {
+    e.preventDefault();
+    helpOpen.value = true;
+    return;
+  }
+
+  if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+    const k = String(e.key || '').toLowerCase();
+    if (k === 'v') {
+      e.preventDefault();
+      setTool('select');
+      return;
+    }
+    if (k === 'p') {
+      e.preventDefault();
+      setTool('pencil');
+      return;
+    }
+    if (k === 'e') {
+      e.preventDefault();
+      setTool('eraser');
+      return;
+    }
+    if (k === 'r') {
+      e.preventDefault();
+      setTool('rect');
+      return;
+    }
+    if (k === 'c') {
+      e.preventDefault();
+      setTool('circle');
+      return;
+    }
+  }
+
   if (isFormulaRecognizeMode.value === true && e.key === 'Escape') {
     e.preventDefault();
     cancelFormulaRecognize();
+    return;
+  }
+
+  if ((currentTool.value === 'rect' || currentTool.value === 'circle') && e.key === 'Escape') {
+    e.preventDefault();
+    cancelShapeDraft();
+    setTool('select');
     return;
   }
 
@@ -1693,65 +2727,14 @@ const handleKeydown = (e) => {
   // 1. 处理撤销 (Ctrl+Z)
   if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) { // 严格匹配 Ctrl+Z (不含 Shift)
     e.preventDefault();
-
-    // [关键修复] 撤销操作保护机制
-    if (undoRedoInProgress) return; // 防止重复撤销
-
-    undoRedoInProgress = true;
-    isUndoRedo = true;
-
-    // 执行撤销操作
-    if (canvas?.isDrawingMode) {
-      suppressNextLocalPathCreated = true;
-      if (suppressNextLocalPathCreatedTimeout) {
-        clearTimeout(suppressNextLocalPathCreatedTimeout);
-      }
-      suppressNextLocalPathCreatedTimeout = setTimeout(() => {
-        suppressNextLocalPathCreated = false;
-        suppressNextLocalPathCreatedTimeout = null;
-      }, 800);
-    }
-    stopLocalDrawingOnce();
-    const cmd = historyManager.undo();
-    if (isDev) {
-      console.log('[UNDO]', cmd?.constructor?.name, cmd?.id);
-    }
-
-    // [关键修复] 延迟完成撤销操作，防止竞态条件
-    // 等待所有异步操作完成后再重置标志
-    if (undoRedoTimeout) clearTimeout(undoRedoTimeout);
-    undoRedoTimeout = setTimeout(() => {
-      isUndoRedo = false;
-      undoRedoInProgress = false;
-      if (isDev) {
-        console.log('[Undo] Protection released');
-      }
-    }, 100); // 100ms 保护期
-
+    performUndo();
     return;
   }
 
   // 2. 处理重做 (Ctrl+Y 或 Ctrl+Shift+Z)
   if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'z'))) {
     e.preventDefault();
-
-    // [关键修复] 重做操作保护机制
-    if (undoRedoInProgress) return; // 防止重复重做
-
-    undoRedoInProgress = true;
-    isUndoRedo = true;
-
-    // 执行重做操作
-    historyManager.redo();
-
-    // [关键修复] 延迟完成重做操作，防止竞态条件
-    if (undoRedoTimeout) clearTimeout(undoRedoTimeout);
-    undoRedoTimeout = setTimeout(() => {
-      isUndoRedo = false;
-      undoRedoInProgress = false;
-      console.log('[Redo] Protection released');
-    }, 100); // 100ms 保护期
-
+    performRedo();
     return;
   }
 
@@ -1821,81 +2804,54 @@ const setTool = (tool) => {
 
   // 1. 处理绘图/选择模式开关
   applyToolMode();
-
-  // 2. 处理添加形状逻辑
-  if (tool === 'rect') {
-    addRect();
-    // 添加完后，自动切回选择模式，方便用户拖拽
-    // 同时也更新 UI 状态
-    currentTool.value = 'select';
-    applyToolMode();
-  } else if (tool === 'circle') {
-    addCircle();
-    currentTool.value = 'select';
-    applyToolMode();
-  }
-};
-
-// --- 方法：添加矩形 ---
-const addRect = () => {
-  const rect = new fabric.Rect({
-    left: 100,
-    top: 100,
-    fill: 'transparent', // 填充透明
-    stroke: 'black',     // 边框黑色
-    strokeWidth: 3,
-    width: 100,
-    height: 100,
-    rx: 5, // 圆角
-    ry: 5
-  });
-  // id 会在 object:added 事件中生成
-  canvas.add(rect);
-  canvas.setActiveObject(rect); // 自动选中它
-};
-
-// --- 方法：添加圆形 ---
-const addCircle = () => {
-  const circle = new fabric.Circle({
-    left: 250,
-    top: 100,
-    fill: 'transparent',
-    stroke: 'black',
-    strokeWidth: 3,
-    radius: 50
-  });
-  canvas.add(circle);
-  canvas.setActiveObject(circle);
 };
 
 // --- 方法：清空画布 ---
-const clearCanvas = () => {
-  if (confirm('确定要清空画布吗？')) {
-    // 遍历所有对象进行 CRDT 删除
-    const objects = canvas.getObjects();
-    objects.forEach(obj => {
-      if (obj.id) {
-        // 生成 Tombstone 并广播
-        const crdtState = crdtManager.delete(obj.id);
-        if (crdtState) {
-          socketService.emit('draw-event', {
-            roomId: ROOM_ID,
-            ...crdtState
-          });
-        }
-      }
-    });
+const clearCanvas = async () => {
+  if (!canvas) return;
+  const ok = await confirmAsync(
+    '确认清空画布',
+    isOnline.value ? '确定要清空画布吗？该操作会同步给房间内所有人。' : '确定要清空画布吗？离线时不会同步给他人。',
+    '清空',
+    '取消'
+  );
+  if (!ok) return;
 
-    canvas.clear();
-    canvas.backgroundColor = '#ffffff';
-    objectMap.clear();
-  }
+  // 遍历所有对象进行 CRDT 删除
+  const objects = canvas.getObjects();
+  objects.forEach(obj => {
+    if (obj.id) {
+      // 生成 Tombstone 并广播
+      const crdtState = crdtManager.delete(obj.id);
+      if (crdtState) {
+        socketService.emit('draw-event', {
+          roomId: ROOM_ID,
+          ...crdtState
+        });
+      }
+    }
+  });
+
+  canvas.clear();
+  canvas.backgroundColor = 'rgba(255,255,255,0)';
+  objectMap.clear();
+  pushToast('success', isOnline.value ? '清空完成（已同步）' : '清空完成（未同步）');
 };
 
-const resetRoom = () => {
-  if (confirm(`确定要重置房间「${ROOM_ID}」吗？所有人都会被清空，且会删除服务端保存的状态。`)) {
-    socketService.emit('clear-room', { roomId: ROOM_ID });
+const resetRoom = async () => {
+  if (!isOnline.value) {
+    pushToast('warning', '离线中：暂时无法重置房间，等我重连一下。', 4200);
+    return;
   }
+  const ok = await confirmAsync(
+    '确认重置房间',
+    `确定要重置房间「${ROOM_ID}」吗？所有人都会被清空，且会删除服务端保存的状态。`,
+    '重置',
+    '取消'
+  );
+  if (!ok) return;
+  socketService.emit('clear-room', { roomId: ROOM_ID });
+  pushToast('info', '已发出重置请求，等待同步…', 4200);
 };
 
 /**
@@ -1950,10 +2906,15 @@ const exportPng = () => {
   if (!canvas) return;
 
   withEphemeralObjectsHidden(() => {
+    const prevBg = canvas.backgroundColor;
+    canvas.backgroundColor = '#ffffff';
+    canvas.requestRenderAll();
     const dataUrl = canvas.toDataURL({
       format: 'png',
       multiplier: 2
     });
+    canvas.backgroundColor = prevBg;
+    canvas.requestRenderAll();
     triggerDownload(`quickboard-${ROOM_ID}.png`, dataUrl);
   });
 };
@@ -1994,116 +2955,454 @@ const exportJson = () => {
 
 <template>
   <div class="relative w-full h-full overflow-hidden">
+    <div class="pointer-events-none absolute inset-0">
+      <div class="absolute inset-0 bg-white/70" />
+      <div class="absolute inset-0 qb-grid opacity-60" />
+      <div class="absolute inset-0 qb-noise opacity-[0.12]" />
+      <div
+        class="absolute inset-0"
+        style="background: radial-gradient(900px circle at 50% 30%, rgba(59,130,246,0.09), transparent 70%), radial-gradient(1100px circle at 50% 100%, rgba(168,85,247,0.06), transparent 68%), radial-gradient(900px circle at 0% 50%, rgba(34,197,94,0.035), transparent 70%), radial-gradient(900px circle at 100% 50%, rgba(59,130,246,0.035), transparent 70%);"
+      />
+    </div>
+
     <!-- Canvas 容器 -->
     <canvas ref="canvasEl"></canvas>
 
-    <!-- 
-      工具栏悬浮层 (Overlay)
-      pointer-events-auto: 允许点击按钮
-    -->
     <div
-      class="absolute top-4 left-1/2 -translate-x-1/2 bg-white px-4 py-2 rounded-lg shadow-lg border border-gray-200 flex gap-2 pointer-events-auto select-none">
+      v-if="currentTool === 'eraser'"
+      class="fixed left-0 top-0 z-50 pointer-events-none"
+      :style="{
+        transform: `translate(${eraserCursorClientX}px, ${eraserCursorClientY}px) translate(-50%, -50%)`
+      }"
+    >
+      <div class="relative w-7 h-7">
+        <div class="absolute inset-0 rounded-full border-2 border-white/90 shadow-[0_10px_24px_-14px_rgba(2,6,23,0.65)]" />
+        <div class="absolute inset-0 rounded-full border border-slate-900/80" />
+        <div class="absolute left-1/2 top-1/2 w-1.5 h-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-slate-900/90" />
+      </div>
+    </div>
 
-      <!-- 选择工具 -->
-      <button @click="setTool('select')" class="p-2 rounded hover:bg-gray-100 transition"
-        :class="{ 'bg-blue-100 text-blue-600': currentTool === 'select' }" title="选择/移动 (V)">
-        🖱️ 选择
-      </button>
-
-      <!-- 画笔工具 -->
-      <button @click="setTool('pencil')" class="p-2 rounded hover:bg-gray-100 transition"
-        :class="{ 'bg-blue-100 text-blue-600': currentTool === 'pencil' }" title="画笔 (P)">
-        ✏️ 画笔
-      </button>
-
-      <div class="w-px h-8 bg-gray-200 mx-1"></div>
-
-      <!-- 形状工具 -->
-      <button @click="setTool('rect')" class="p-2 rounded hover:bg-gray-100 transition" title="添加矩形">
-        ⬛ 矩形
-      </button>
-
-      <button @click="setTool('circle')" class="p-2 rounded hover:bg-gray-100 transition" title="添加圆形">
-        ⭕ 圆形
-      </button>
-
-      <button @click="insertFormula" class="p-2 rounded hover:bg-gray-100 transition" title="插入公式（LaTeX，编辑时上锁）">
-        ∑ 公式
-      </button>
-      <button
-        @click="startFormulaRecognize"
-        :disabled="isFormulaRecognizing"
-        class="p-2 rounded hover:bg-gray-100 transition disabled:opacity-50 disabled:cursor-not-allowed"
-        title="公式识别（框选手写区域 → 转 LaTeX）"
-      >
-        🔍 识别
-      </button>
-
-      <div class="w-px h-8 bg-gray-200 mx-1"></div>
-
-      <!-- 操作工具 -->
-      <button @click="clearCanvas" class="p-2 rounded hover:bg-red-100 text-red-500 transition" title="清空画布">
-        🗑️ 清空
-      </button>
-      <button @click="resetRoom" class="p-2 rounded hover:bg-red-100 text-red-500 transition" title="重置房间">
-        ♻️ 重置
-      </button>
-
-      <div class="w-px h-8 bg-gray-200 mx-1"></div> <!-- 分隔线 -->
-
-      <!-- 导出工具 -->
-      <button @click="exportPng" class="p-2 rounded hover:bg-gray-100 transition" title="导出 PNG（当前视图）">
-        🖼️ PNG
-      </button>
-      <button @click="exportJson" class="p-2 rounded hover:bg-gray-100 transition" title="导出 JSON（画布对象）">
-        🧾 JSON
-      </button>
-      <button @click="resetView" class="p-2 rounded hover:bg-gray-100 transition" title="复位视图 (Ctrl+0 / 双击画布)">
-        🧭 复位
-      </button>
-
-      <div class="w-px h-8 bg-gray-200 mx-1"></div> <!-- 分隔线 -->
-
-      <input
-        v-model="myName"
-        class="h-9 w-28 px-2 rounded border border-gray-200 text-sm"
-        placeholder="昵称"
-        title="设置昵称（本地保存）"
-        @keydown.enter="saveMyName"
-        @blur="saveMyName"
-      />
-
-      <div class="w-px h-8 bg-gray-200 mx-1"></div>
-
-      <!-- 房间工具：分享链接 / 切换房间 -->
-      <button @click="copyRoomLink" class="p-2 rounded hover:bg-gray-100 transition" title="复制房间链接">
-        🔗 分享
-      </button>
-      <input
-        v-model="roomIdInput"
-        class="h-9 w-32 px-2 rounded border border-gray-200 text-sm"
-        placeholder="room id"
-        title="输入房间号并回车/点击进入"
-        @keydown.enter="goToRoom"
-      />
-      <button @click="goToRoom" class="p-2 rounded hover:bg-gray-100 transition" title="进入房间（会刷新页面）">
-        ↩️ 进入
-      </button>
-      <!-- 连接状态指示器 -->
+    <div v-if="toolRingMounted" class="absolute inset-0 z-40 pointer-events-none">
       <div
-        class="absolute bottom-4 right-4 bg-white/80 backdrop-blur px-3 py-1 rounded-full text-xs text-gray-500 shadow-sm border border-gray-200">
-        Room: {{ ROOM_ID }}
-        <span v-if="connectionState === 'connected'">🟢 Connected</span>
-        <span v-else-if="connectionState === 'connecting'">🟡 Connecting</span>
-        <span v-else>🔴 Disconnected</span>
-        <div v-if="onlineUsersCount" class="mt-0.5 text-[10px] text-gray-600" :title="onlineUsersLabel">
-          在线：{{ onlineUsersCount }}人
+        class="absolute left-0 top-0 qb-ring-container"
+        :class="toolRingVisible ? 'qb-ring-enter' : ''"
+        :style="{
+          width: `${toolRingSize}px`,
+          height: `${toolRingSize}px`,
+          '--qb-ring-x': `${toolRingX}px`,
+          '--qb-ring-y': `${toolRingY}px`,
+          opacity: toolRingVisible ? 1 : 0,
+          transition: 'opacity 180ms ease-out'
+        }"
+      >
+        <div class="absolute inset-0 qb-ring-shadow" />
+
+        <svg class="absolute inset-0" :viewBox="`0 0 ${toolRingSize} ${toolRingSize}`">
+        <defs>
+          <radialGradient id="qbRingBase" cx="50%" cy="45%" r="70%">
+            <stop offset="0%" stop-color="rgba(255,255,255,0.88)" />
+            <stop offset="60%" stop-color="rgba(255,255,255,0.62)" />
+            <stop offset="100%" stop-color="rgba(255,255,255,0.52)" />
+          </radialGradient>
+          <linearGradient id="qbWedgeHover" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="rgba(59,130,246,0.20)" />
+            <stop offset="55%" stop-color="rgba(168,85,247,0.18)" />
+            <stop offset="100%" stop-color="rgba(34,197,94,0.14)" />
+          </linearGradient>
+          <filter id="qbRingGlow" x="-140%" y="-140%" width="380%" height="380%">
+            <feDropShadow dx="0" dy="0" stdDeviation="10" flood-color="rgba(59,130,246,0.26)" />
+          </filter>
+        </defs>
+
+        <g :key="toolRingOpenSeq">
+          <circle
+            :cx="toolRingCenter"
+            :cy="toolRingCenter"
+            :r="toolRingOuterRadius + 2"
+            fill="url(#qbRingBase)"
+            stroke="rgba(148,163,184,0.35)"
+            stroke-width="1"
+          />
+          <circle
+            :cx="toolRingCenter"
+            :cy="toolRingCenter"
+            :r="toolRingInnerRadius - 2"
+            fill="rgba(255,255,255,0.74)"
+            stroke="rgba(148,163,184,0.35)"
+            stroke-width="1"
+          />
+
+          <g filter="url(#qbRingGlow)">
+            <path
+              v-for="(it, idx) in toolRingItems"
+              :key="it.key"
+              :d="getToolRingSectorPath(idx, toolRingItems.length)"
+              :style="getToolRingSectorStyle(idx)"
+              :fill="toolRingHoverKey === it.key ? 'url(#qbWedgeHover)' : 'rgba(255,255,255,0.62)'"
+              :stroke="toolRingHoverKey === it.key ? 'rgba(59,130,246,0.58)' : 'rgba(148,163,184,0.50)'"
+              stroke-width="1"
+            />
+
+            <g
+              v-for="(it, idx) in toolRingItems"
+              :key="`t-${it.key}`"
+              :style="getToolRingIconStyle(idx, toolRingItems.length, toolRingHoverKey === it.key)"
+              v-html="it.iconSvg"
+            ></g>
+          </g>
+        </g>
+        </svg>
+
+        <div class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-center">
+          <div class="text-xs text-gray-500">工具环</div>
+          <div class="mt-0.5 text-sm font-medium text-gray-800">
+            {{ toolRingHoverLabel || '拖到扇形松开' }}
+          </div>
         </div>
-        <div v-if="selectedFormulaLockLabel" class="mt-0.5 text-[10px] text-gray-600">
-          {{ selectedFormulaLockLabel }}
+      </div>
+    </div>
+
+    <!-- Toast 容器：右上角非阻塞提示 -->
+    <div class="absolute top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none">
+      <div
+        v-for="t in toasts"
+        :key="t.id"
+        class="pointer-events-auto max-w-[min(360px,92vw)] rounded-md border px-3 py-2 text-sm shadow-lg backdrop-blur bg-white/90"
+        :class="{
+          'border-green-200 text-green-700': t.type === 'success',
+          'border-red-200 text-red-700': t.type === 'error',
+          'border-yellow-200 text-yellow-800': t.type === 'warning',
+          'border-gray-200 text-gray-700': t.type === 'info'
+        }"
+      >
+        {{ t.message }}
+      </div>
+    </div>
+
+    <div class="absolute top-4 left-1/2 -translate-x-1/2 z-40 pointer-events-auto select-none">
+      <div class="relative">
+        <div
+          class="rounded-full border border-gray-200/70 bg-white/72 backdrop-blur shadow-md px-2 py-1.5 opacity-90 hover:opacity-100 transition-opacity"
+        >
+          <div class="flex items-center gap-1">
+            <button
+              @click="toggleToolbarExpanded"
+              :class="simpleBtnClass()"
+              :title="toolbarShowAdvanced ? '收起更多操作' : '展开更多操作'"
+            >
+              <span class="text-base">{{ toolbarShowAdvanced ? '▾' : '▸' }}</span>
+              <span class="text-sm">更多</span>
+            </button>
+
+            <button @click="openHelp" :class="simpleBtnClass()" title="快捷键与帮助 (?)">
+              <span class="text-base">?</span>
+              <span class="text-sm">帮助</span>
+            </button>
+
+            <div class="mx-1 h-6 w-px bg-gray-200" />
+
+            <button @click="setTool('select')" :class="toolBtnClass('select')" title="选择/移动 (V)">
+              <span class="text-sm">选择</span>
+            </button>
+
+            <button @click="setTool('pencil')" :class="toolBtnClass('pencil')" title="画笔 (P)">
+              <span class="text-sm">画笔</span>
+            </button>
+
+            <button @click="setTool('eraser')" :class="toolBtnClass('eraser')" title="橡皮 (E) 点到对象就删除">
+              <span class="text-sm">橡皮</span>
+            </button>
+
+            <div class="ml-1 text-[11px] text-gray-500 whitespace-nowrap">
+              右键/长按：调色盘工具环
+            </div>
+          </div>
         </div>
-        <div v-if="formulaRecognizeHint" class="mt-0.5 text-[10px] text-gray-600">
-          {{ formulaRecognizeHint }}
+
+        <div class="absolute left-1/2 -translate-x-1/2 mt-2 w-[min(820px,92vw)]">
+            <div
+            class="rounded-2xl border border-gray-200/70 bg-white/76 backdrop-blur shadow-lg p-3 origin-top overflow-hidden transition-all duration-200 ease-out"
+            :class="
+              toolbarShowAdvanced
+                ? 'max-h-[480px] opacity-100 translate-y-0 scale-100'
+                : 'max-h-0 opacity-0 -translate-y-1 scale-[0.98] pointer-events-none'
+            "
+          >
+            <div class="flex flex-col gap-3">
+              <div class="flex flex-wrap items-center gap-1">
+                <div class="text-xs font-medium text-gray-600 mr-2">工具</div>
+
+                <button @click="setTool('select')" :class="toolBtnClass('select')" title="选择/移动 (V)">
+                  <span class="text-sm">选择</span>
+                </button>
+
+                <button @click="setTool('pencil')" :class="toolBtnClass('pencil')" title="画笔 (P)">
+                  <span class="text-sm">画笔</span>
+                </button>
+
+                <button @click="setTool('eraser')" :class="toolBtnClass('eraser')" title="橡皮 (E) 点到对象就删除">
+                  <span class="text-sm">橡皮</span>
+                </button>
+
+                <button @click="setTool('rect')" :class="simpleBtnClass()" title="矩形 (R)">
+                  <span v-if="!toolbarCompact">矩形</span>
+                </button>
+
+                <button @click="setTool('circle')" :class="simpleBtnClass()" title="圆形 (C)">
+                  <span v-if="!toolbarCompact">圆形</span>
+                </button>
+
+                <button @click="insertFormula" :class="simpleBtnClass()" title="插入公式（LaTeX，编辑时上锁）">
+                  <span v-if="!toolbarCompact">公式</span>
+                </button>
+
+                <button
+                  @click="startFormulaRecognize"
+                  :disabled="isFormulaRecognizing || !isOnline"
+                  :class="simpleBtnDisabledClass()"
+                  :title="isOnline ? '识别手写公式（框选区域 → 转 LaTeX）' : '离线中：识别需要后端服务'"
+                >
+                  <span v-if="!toolbarCompact">识别</span>
+                </button>
+              </div>
+
+              <div class="flex flex-wrap items-center gap-1">
+                <div class="text-xs font-medium text-gray-600 mr-2">操作</div>
+
+                <button @click="exportPng" :class="simpleBtnClass()" title="导出 PNG（当前视图）">
+                  <span v-if="!toolbarCompact">PNG</span>
+                </button>
+
+                <button @click="exportJson" :class="simpleBtnClass()" title="导出 JSON（画布对象）">
+                  <span v-if="!toolbarCompact">JSON</span>
+                </button>
+
+                <button @click="resetView" :class="simpleBtnClass()" title="复位视图 (Ctrl+0 / 双击画布)">
+                  <span v-if="!toolbarCompact">复位</span>
+                </button>
+
+                <button
+                  @click="requestFullSync"
+                  :disabled="!canRequestSync"
+                  :class="simpleBtnDisabledClass()"
+                  :title="canRequestSync ? '强制从服务端拉全量快照，用于不同步时的兜底对齐' : '离线中：等待重连后再对齐'"
+                >
+                  <span v-if="!toolbarCompact">对齐</span>
+                </button>
+
+                <button @click="copyRoomLink" :class="simpleBtnClass()" title="复制房间链接">
+                  <span v-if="!toolbarCompact">分享</span>
+                </button>
+              </div>
+
+              <div class="flex flex-wrap items-center gap-1">
+                <div class="text-xs font-medium text-gray-600 mr-2">房间</div>
+
+                <input
+                  v-model="myName"
+                  class="h-9 w-28 px-2 rounded-md border border-gray-200 text-sm bg-white/70 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                  placeholder="昵称"
+                  title="昵称（回车/失焦保存）"
+                  @keydown.enter="saveMyName"
+                  @blur="saveMyName"
+                />
+
+                <input
+                  v-model="roomIdInput"
+                  class="h-9 w-32 px-2 rounded-md border border-gray-200 text-sm bg-white/70 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                  placeholder="room id"
+                  title="输入房间号并回车/点击进入"
+                  @keydown.enter="goToRoom"
+                />
+
+                <button @click="goToRoom" :class="simpleBtnClass()" title="进入房间（会刷新页面）">
+                  <span v-if="!toolbarCompact">进入</span>
+                </button>
+
+                <button @click="clearCanvas" :class="dangerBtnClass()" title="清空画布">
+                  <span v-if="!toolbarCompact">清空</span>
+                </button>
+
+                <button
+                  @click="resetRoom"
+                  :disabled="!isOnline"
+                  :class="dangerBtnDisabledClass()"
+                  :title="isOnline ? '重置房间（清空服务端保存状态，所有人都会被清空）' : '离线中：无法重置房间'"
+                >
+                  <span v-if="!toolbarCompact">重置</span>
+                </button>
+              </div>
+
+              <div v-if="toolbarCompact" class="text-[10px] text-gray-500">
+                <span :title="onlineUsersLabel">在线 {{ onlineUsersCount }} 人</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div
+      class="absolute bottom-4 right-4 z-40 w-[min(360px,92vw)] rounded-xl border border-gray-200 bg-white/85 backdrop-blur px-3 py-2 shadow-md pointer-events-auto"
+    >
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex items-center gap-2">
+          <span
+            class="inline-flex h-2.5 w-2.5 rounded-full"
+            :class="{
+              'bg-green-500': connectionState === 'connected',
+              'bg-yellow-400': connectionState === 'connecting',
+              'bg-red-500': connectionState === 'disconnected'
+            }"
+          />
+          <div class="text-xs text-gray-700">
+            <span class="font-medium">{{ ROOM_ID }}</span>
+            <span class="ml-1 text-gray-500">
+              <span v-if="connectionState === 'connected'">在线</span>
+              <span v-else-if="connectionState === 'connecting'">连接中</span>
+              <span v-else>离线</span>
+            </span>
+          </div>
+        </div>
+        <button
+          @click="requestFullSync"
+          :disabled="!canRequestSync"
+          class="h-8 px-2 rounded-md text-xs border border-gray-200 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+          :title="canRequestSync ? '对齐同步' : '离线中：等待重连后再对齐'"
+        >
+          对齐
+        </button>
+      </div>
+
+      <div v-if="connectionState === 'disconnected'" class="mt-1 text-[11px] text-red-600">
+        离线中：你的本地绘制不会同步给其他人
+      </div>
+
+      <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-gray-600">
+        <span v-if="onlineUsersCount" :title="onlineUsersLabel">在线 {{ onlineUsersCount }} 人</span>
+        <span v-if="selectedFormulaLockLabel">{{ selectedFormulaLockLabel }}</span>
+        <span v-if="formulaRecognizeHint">{{ formulaRecognizeHint }}</span>
+      </div>
+
+      <div v-if="syncErrorLabel" class="mt-1 text-[11px] text-red-600">
+        对齐失败：{{ syncErrorLabel }}
+      </div>
+      <div v-else-if="lastSyncAt" class="mt-1 text-[11px] text-gray-600">
+        最近对齐：{{ new Date(lastSyncAt).toLocaleTimeString() }}
+      </div>
+
+      <div v-if="netSimEnabled" class="mt-1 text-[11px] text-gray-600" :title="netSimTooltip">
+        弱网：{{ netSimLabel }}
+      </div>
+    </div>
+
+    <div v-if="helpOpen" class="absolute inset-0 z-40 bg-black/30 flex items-center justify-center pointer-events-auto">
+      <div class="w-[min(560px,92vw)] bg-white rounded-lg shadow-xl border border-gray-200 p-4">
+        <div class="flex items-center justify-between gap-2">
+          <div class="text-sm font-medium text-gray-800">快捷键与小贴士</div>
+          <button
+            @click="closeHelp"
+            class="h-8 px-2 rounded-md border border-gray-200 hover:bg-gray-50 text-sm"
+            title="关闭 (Esc)"
+          >
+            关闭
+          </button>
+        </div>
+        <div class="mt-2 text-sm text-gray-600">
+          快速上手：选中工具 → 画/拖/缩放 → 分享房间链接。
+        </div>
+
+        <div class="mt-2 text-xs text-gray-500">
+          矩形/圆形：切到工具后，在画布上<strong>按住拖拽</strong>创建；<span class="font-mono">Esc</span> 可取消。
+        </div>
+
+        <div class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm">
+          <div class="rounded-md border border-gray-200 bg-gray-50 p-3">
+            <div class="text-xs font-medium text-gray-700">工具</div>
+            <div class="mt-1 text-xs text-gray-600 space-y-1">
+              <div><span class="font-mono">V</span> 选择/移动</div>
+              <div><span class="font-mono">P</span> 画笔</div>
+              <div><span class="font-mono">E</span> 橡皮（点到对象就删除）</div>
+              <div><span class="font-mono">R</span> 矩形</div>
+              <div><span class="font-mono">C</span> 圆形</div>
+            </div>
+          </div>
+
+          <div class="rounded-md border border-gray-200 bg-gray-50 p-3">
+            <div class="text-xs font-medium text-gray-700">视图</div>
+            <div class="mt-1 text-xs text-gray-600 space-y-1">
+              <div><span class="font-mono">Space</span> 按住拖拽平移</div>
+              <div><span class="font-mono">Ctrl/⌘ + 0</span> 复位视图</div>
+              <div><span class="font-mono">Ctrl/⌘ + +/-</span> 缩放</div>
+              <div>双击画布：复位视图 / 公式对象双击编辑</div>
+            </div>
+          </div>
+
+          <div class="rounded-md border border-gray-200 bg-gray-50 p-3">
+            <div class="text-xs font-medium text-gray-700">历史</div>
+            <div class="mt-1 text-xs text-gray-600 space-y-1">
+              <div><span class="font-mono">Ctrl/⌘ + Z</span> 撤销</div>
+              <div><span class="font-mono">Ctrl/⌘ + Y</span> 重做</div>
+              <div><span class="font-mono">Ctrl/⌘ + Shift + Z</span> 重做</div>
+            </div>
+          </div>
+
+          <div class="rounded-md border border-gray-200 bg-gray-50 p-3">
+            <div class="text-xs font-medium text-gray-700">识别与同步</div>
+            <div class="mt-1 text-xs text-gray-600 space-y-1">
+              <div><span class="font-mono">Esc</span> 取消框选识别 / 关闭帮助</div>
+              <div>不同步时：点右下角“对齐”兜底</div>
+              <div>想复现弱网：URL 加 <span class="font-mono">netsim=1</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-3 text-xs text-gray-500">
+          轻量小乐趣：把链接发给朋友，一起画出“同步的涂鸦”。
+        </div>
+      </div>
+    </div>
+
+    <!-- 确认弹窗：用于危险操作（清空/重置） -->
+    <div v-if="confirmOpen" class="absolute inset-0 z-40 bg-black/30 flex items-center justify-center pointer-events-auto">
+      <div class="w-[min(420px,92vw)] bg-white rounded-lg shadow-xl border border-gray-200 p-4">
+        <div class="text-sm font-medium text-gray-800">{{ confirmTitle }}</div>
+        <div class="mt-2 text-sm text-gray-600 whitespace-pre-wrap">{{ confirmMessage }}</div>
+        <div class="mt-4 flex justify-end gap-2">
+          <button
+            @click="closeConfirm(false)"
+            class="px-3 py-1.5 rounded border border-gray-200 hover:bg-gray-50 text-sm"
+          >
+            {{ confirmCancelText }}
+          </button>
+          <button
+            @click="closeConfirm(true)"
+            class="px-3 py-1.5 rounded bg-red-600 hover:bg-red-700 text-white text-sm"
+          >
+            {{ confirmOkText }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 手动复制弹窗：剪贴板 API 失败时兜底 -->
+    <div v-if="manualCopyOpen" class="absolute inset-0 z-40 bg-black/30 flex items-center justify-center pointer-events-auto">
+      <div class="w-[min(520px,92vw)] bg-white rounded-lg shadow-xl border border-gray-200 p-4">
+        <div class="text-sm font-medium text-gray-800">手动复制链接</div>
+        <div class="mt-2 text-xs text-gray-500">浏览器未授予剪贴板权限或环境限制，已提供可手动复制的链接。</div>
+        <input
+          :value="manualCopyText"
+          readonly
+          class="mt-3 w-full h-10 px-2 rounded border border-gray-200 text-sm font-mono"
+          @focus="$event.target && $event.target.select && $event.target.select()"
+        />
+        <div class="mt-4 flex justify-end gap-2">
+          <button
+            @click="closeManualCopy"
+            class="px-3 py-1.5 rounded border border-gray-200 hover:bg-gray-50 text-sm"
+          >
+            关闭
+          </button>
         </div>
       </div>
     </div>

@@ -46,6 +46,36 @@ const ROOM_DELTA_LOG_LIMIT = Number.isFinite(Number(deltaLogLimitRaw))
   ? Math.max(100, Math.min(50000, Number(deltaLogLimitRaw)))
   : 5000;
 
+// --- 定期快照对齐（Periodic Snapshot Sync）---
+//
+// 给外行看的解释：
+// - 我们的同步主要依赖“增量事件 draw-event”，它效率高，但对网络质量更敏感：
+//   - 浏览器后台挂起/弱网/偶发丢包时，客户端可能漏掉部分增量；
+//   - 只要漏掉的是“删除”类事件，本地就可能残留一个不该存在的对象；
+// - 因此我们增加一个工程级兜底：服务端按固定周期向房间广播一次“权威快照”。
+//
+// 设计原则：
+// - 快照不参与 CRDT 冲突裁决（裁决仍是 LWW 时间戳）；
+// - 快照的目的只是让客户端“定期补齐漏掉的变化”，尤其是漏掉的删除 tombstone；
+// - 为避免无谓带宽浪费：只有当房间版本号在上次快照后发生变化，才会广播快照。
+//
+// 配置方式（环境变量）：
+// - ROOM_SNAPSHOT_INTERVAL_SECONDS：快照广播周期（秒）。
+//   - 默认 30 秒；
+//   - 设为 0/false/no/off 关闭。
+const snapshotIntervalRaw = String(process.env.ROOM_SNAPSHOT_INTERVAL_SECONDS || '').trim().toLowerCase();
+const snapshotIntervalSeconds = !snapshotIntervalRaw
+  ? 30
+  : (['0', 'false', 'no', 'off'].includes(snapshotIntervalRaw)
+      ? 0
+      : (Number.isFinite(Number(snapshotIntervalRaw)) ? Math.max(1, Number(snapshotIntervalRaw)) : 30));
+const ROOM_SNAPSHOT_INTERVAL_MS = snapshotIntervalSeconds * 1000;
+
+// roomLastSnapshotVersion[roomId] = number
+// - 记录这个房间上次广播快照时的 serverVersion；
+// - 用于判断“房间在这段时间里是否有变化”，避免重复发同一份快照。
+const roomLastSnapshotVersion = {};
+
 // 结构: { roomId: { resourceId: { ownerId, ownerName, expiresAt } } }
 const roomLocks = {};
 
@@ -153,19 +183,55 @@ function getDeltaMinVersion(roomId) {
   return first && typeof first.v === 'number' ? first.v : null;
 }
 
-function sendFullSync(socket, roomId) {
+/**
+ * 构造某个房间的“权威快照 payload”。
+ *
+ * 注意：这里把“存活对象”和“删除墓碑（tombstone）”拆开：
+ * - objects：只包含当前存活对象（方便前端直接渲染）
+ * - tombstones：只包含 { _deleted: true } 的最小信息（用于让漏掉删除事件的客户端也能收敛）
+ *
+ * 为什么 tombstone 必须在快照里出现？
+ * - 如果只发存活对象，那客户端即使拿到了最新快照，也无法知道“哪些对象已经被删除”；
+ * - 一旦客户端漏掉了某次删除 draw-event，它就会一直保留该对象（因为快照里也不会出现它）；
+ * - 发 tombstone 能让客户端把该对象标记为已删除，从而真正实现“最终一致”。
+ */
+function buildRoomSnapshotPayload(roomId) {
   const room = roomStates[roomId];
-  const activeObjects = room
-    ? Object.values(room).filter((item) => {
-        return !(item && item.data && (item.data._deleted || isGhostPolylineData(item.data)));
-      })
-    : [];
-  socket.emit('sync-state', {
+  const objects = [];
+  const tombstones = [];
+
+  if (room) {
+    for (const item of Object.values(room)) {
+      if (!item || !item.data) continue;
+      if (isGhostPolylineData(item.data)) continue;
+
+      if (item.data._deleted) {
+        const tsRaw = item.timestamps && item.timestamps._deleted;
+        const ts =
+          typeof tsRaw === 'number' && Number.isFinite(tsRaw) && tsRaw >= 0 ? tsRaw : 0;
+        tombstones.push({
+          id: item.id,
+          data: { _deleted: true },
+          timestamps: { _deleted: ts }
+        });
+        continue;
+      }
+
+      objects.push(item);
+    }
+  }
+
+  return {
     roomId,
     serverEpoch: SERVER_EPOCH,
     serverVersion: getRoomVersion(roomId),
-    objects: activeObjects
-  });
+    objects,
+    tombstones
+  };
+}
+
+function sendFullSync(socket, roomId) {
+  socket.emit('sync-state', buildRoomSnapshotPayload(roomId));
 }
 
 function sendDeltaSync(socket, roomId, fromVersion) {
@@ -354,6 +420,9 @@ function destroyRoom(roomId) {
   if (roomEmptySince[roomId]) {
     delete roomEmptySince[roomId];
   }
+  if (roomLastSnapshotVersion[roomId] != null) {
+    delete roomLastSnapshotVersion[roomId];
+  }
   if (changed) saveStates();
   return changed;
 }
@@ -515,6 +584,33 @@ const io = new Server(server, {
   }
 });
 
+// --- 定期快照对齐（Periodic Snapshot Sync）---
+//
+// 触发条件：
+// - 周期到达（ROOM_SNAPSHOT_INTERVAL_SECONDS）
+// - 且该房间当前有人在线
+// - 且房间版本号相比上一次快照已发生变化（避免重复广播）
+//
+// 广播内容：
+// - sync-state（包含 objects + tombstones），客户端按 CRDT/LWW 规则合并即可。
+if (ROOM_SNAPSHOT_INTERVAL_MS > 0) {
+  const timer = setInterval(() => {
+    for (const roomId of Object.keys(roomStates)) {
+      if (getRoomConnCount(io, roomId) <= 0) continue;
+      const currentV = getRoomVersion(roomId);
+      const lastV = roomLastSnapshotVersion[roomId];
+      if (typeof lastV === 'number' && lastV === currentV) continue;
+
+      roomLastSnapshotVersion[roomId] = currentV;
+      io.to(roomId).emit('sync-state', {
+        ...buildRoomSnapshotPayload(roomId),
+        reason: 'periodic'
+      });
+    }
+  }, ROOM_SNAPSHOT_INTERVAL_MS);
+  if (timer && typeof timer.unref === 'function') timer.unref();
+}
+
 // --- 房间自动销毁（空房间 TTL）---
 //
 // 给外行看的解释：
@@ -615,6 +711,37 @@ io.on('connection', (socket) => {
       locks: getRoomLockSnapshot(roomId),
       serverNow: Date.now()
     });
+  });
+
+  /**
+   * 手动请求“全量快照对齐”（兜底入口）。
+   *
+   * 适用场景（给外行看的解释）：
+   * - 协作白板是“高频实时同步”系统，理论上只要网络正常，客户端会持续收增量并保持一致；
+   * - 但在极端情况下（例如：网络波动、浏览器后台挂起、客户端误操作），用户可能产生“我感觉不同步了”的主观体验；
+   * - 这时提供一个“强制重新对齐到服务端权威状态”的按钮，会比让用户刷新页面更友好。
+   *
+   * 设计原则：
+   * - 这是“工程兜底”，不改变 CRDT 的冲突解决规则；
+   * - 只对“已经加入该房间”的 socket 生效，避免被用作探测其它房间数据。
+   */
+  socket.on('request-sync', (payload, ack) => {
+    const roomId = payload && payload.roomId;
+    if (!roomId || typeof roomId !== 'string') {
+      if (typeof ack === 'function') ack({ ok: false, error: 'INVALID_ROOM' });
+      return;
+    }
+    if (!joinedRooms.has(roomId)) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'NOT_IN_ROOM' });
+      return;
+    }
+
+    // 兜底策略：无论客户端版本号是多少，都直接发全量快照，保证“按一次就能对齐”。
+    sendFullSync(socket, roomId);
+
+    if (typeof ack === 'function') {
+      ack({ ok: true, serverEpoch: SERVER_EPOCH, serverVersion: getRoomVersion(roomId) });
+    }
   });
 
   /**

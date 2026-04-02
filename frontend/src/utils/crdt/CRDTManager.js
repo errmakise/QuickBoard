@@ -105,8 +105,19 @@ export class CRDTManager {
     let lww = this.objects.get(id);
     
     if (!lww) {
-      // 如果是新对象，创建一个新的 LWWMap 实例
-      lww = new LWWMap(id, data);
+      /**
+       * 如果是“新对象”，不能直接用 `new LWWMap(id, data)`：
+       * - LWWMap 构造函数会用 `logicalClock.get()` 给每个字段打时间戳；
+       * - 但撤销/重做的语义是“强制使用指定 timestamp”，否则会出现：
+       *   1) 发送给服务端的时间戳过小，被判定为旧数据而丢弃；
+       *   2) 本地与远端在冲突裁决上出现不一致（看起来像‘重做没生效’）。
+       *
+       * 所以这里先创建空对象，再把每个字段用同一个 timestamp 写入。
+       */
+      lww = new LWWMap(id, {});
+      Object.keys(data).forEach(key => {
+        lww.set(key, data[key], timestamp);
+      });
       this.objects.set(id, lww);
     } else {
       // 如果是现有对象，遍历所有变更的属性，使用指定时间戳

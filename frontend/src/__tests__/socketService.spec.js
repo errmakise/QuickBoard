@@ -35,6 +35,11 @@ describe('SocketService', () => {
     }
 
     vi.resetModules()
+    try {
+      window?.localStorage?.removeItem('QB_NETSIM')
+    } catch {
+      // ignore
+    }
   })
 
   it('allows registering listeners before connect', async () => {
@@ -68,5 +73,71 @@ describe('SocketService', () => {
     connectHandler()
 
     expect(socket.emit).toHaveBeenCalledWith('join-room', { roomId: 'room-1', userName: 'Alice', clientVersion: 12 })
+  })
+
+  it('drops outbound events when netSim send dropRate=1', async () => {
+    const { default: socketService } = await import('../services/socket.js')
+
+    socketService.initNetworkSimulation()
+    socketService.setNetworkSimulation({
+      enabled: true,
+      send: { dropRate: 1, delayMs: 0, jitterMs: 0 },
+      receive: { dropRate: 0, delayMs: 0, jitterMs: 0 }
+    })
+
+    socketService.connect('room-1')
+    const connectHandler = getListener('connect')
+    connectHandler()
+
+    socket.emit.mockClear()
+    socketService.emit('draw-event', { roomId: 'room-1', id: 'o1' })
+    expect(socket.emit).not.toHaveBeenCalled()
+  })
+
+  it('delays outbound events when netSim send delay configured', async () => {
+    vi.useFakeTimers()
+    const { default: socketService } = await import('../services/socket.js')
+
+    socketService.initNetworkSimulation()
+    socketService.setNetworkSimulation({
+      enabled: true,
+      send: { dropRate: 0, delayMs: 120, jitterMs: 0 },
+      receive: { dropRate: 0, delayMs: 0, jitterMs: 0 }
+    })
+
+    socketService.connect('room-1')
+    const connectHandler = getListener('connect')
+    connectHandler()
+
+    socket.emit.mockClear()
+    socketService.emit('cursor-move', { roomId: 'room-1', x: 1, y: 2 })
+    expect(socket.emit).not.toHaveBeenCalled()
+
+    vi.advanceTimersByTime(119)
+    expect(socket.emit).not.toHaveBeenCalled()
+
+    vi.advanceTimersByTime(1)
+    expect(socket.emit).toHaveBeenCalledWith('cursor-move', { roomId: 'room-1', x: 1, y: 2 })
+    vi.useRealTimers()
+  })
+
+  it('drops inbound events when netSim receive dropRate=1', async () => {
+    const { default: socketService } = await import('../services/socket.js')
+
+    socketService.initNetworkSimulation()
+    socketService.setNetworkSimulation({
+      enabled: true,
+      send: { dropRate: 0, delayMs: 0, jitterMs: 0 },
+      receive: { dropRate: 1, delayMs: 0, jitterMs: 0 }
+    })
+
+    const syncCb = vi.fn()
+    socketService.on('sync-state', syncCb)
+    socketService.connect('room-1')
+
+    const inbound = getListener('sync-state')
+    inbound({ roomId: 'room-1', objects: [] })
+
+    expect(syncCb).not.toHaveBeenCalled()
   })
 })

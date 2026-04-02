@@ -8,10 +8,10 @@ describe('App', () => {
     const wrapper = mount(App, {
       global: {
         stubs: {
-          Whiteboard: { template: '<div data-test="whiteboard-stub"></div>' }
+          RouterView: { template: '<div data-test="router-view-stub"></div>' }
         }
       }
     })
-    expect(wrapper.find('[data-test="whiteboard-stub"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="router-view-stub"]').exists()).toBe(true)
   })
 })

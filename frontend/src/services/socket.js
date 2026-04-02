@@ -4,10 +4,277 @@ class SocketService {
   constructor() {
     this.socket = null;
     this.callbacks = new Map();
+    this.wrappedCallbacks = new Map();
     this.roomId = null;
     this.userName = '';
     this.clientVersion = 0;
     this._fallbackTried = false;
+
+    // --- 弱网模拟（仅用于开发/验证）---
+    //
+    // 给外行看的解释：
+    // - “协同白板”这类实时系统，问题往往不在功能本身，而在“网络不稳定时是否还能收敛一致”；
+    // - 真实弱网很难复现，所以我们在客户端做一个“可控的网络模拟器”：
+    //   - 发出去的消息可以随机延迟/丢弃；
+    //   - 收到的消息也可以随机延迟/丢弃；
+    // - 这样就能在本机开 2 个标签页，稳定复现“乱序/丢包/延迟”并观察一致性效果。
+    //
+    // 设计原则：
+    // - 只模拟“业务事件”（draw-event / sync-state / cursor-move 等），不模拟 socket.io 的底层握手；
+    // - 默认关闭；可通过 URL 参数或 localStorage 开启（详见文档）。
+    this.netSim = {
+      enabled: false,
+      send: { dropRate: 0, delayMs: 0, jitterMs: 0 },
+      receive: { dropRate: 0, delayMs: 0, jitterMs: 0 }
+    };
+    this.netSimStats = {
+      sendTotal: 0,
+      sendDropped: 0,
+      sendDelayed: 0,
+      recvTotal: 0,
+      recvDropped: 0,
+      recvDelayed: 0,
+      lastSendDelayMs: 0,
+      lastRecvDelayMs: 0
+    };
+    this._netSimInitialized = false;
+  }
+
+  _clampNumber(v, min, max, fallback) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
+  }
+
+  _truthyFlag(raw) {
+    const s = String(raw ?? '').trim().toLowerCase();
+    if (!s) return false;
+    return ['1', 'true', 'yes', 'on', 'enable', 'enabled'].includes(s);
+  }
+
+  _shouldSimulateEvent(event) {
+    // Socket.IO 内建生命周期事件不做模拟，避免误导连接状态。
+    return event !== 'connect' && event !== 'disconnect' && event !== 'connect_error';
+  }
+
+  _randomDelay(baseMs, jitterMs) {
+    const base = this._clampNumber(baseMs, 0, 60000, 0);
+    const jitter = this._clampNumber(jitterMs, 0, 60000, 0);
+    if (jitter <= 0) return base;
+    return base + Math.floor(Math.random() * jitter);
+  }
+
+  _emitNow(event, data, ack) {
+    if (!this.socket || !this.socket.connected) return;
+    if (typeof ack === 'function') {
+      this.socket.emit(event, data, ack);
+    } else {
+      this.socket.emit(event, data);
+    }
+  }
+
+  _emitWithSimulation(event, data, ack) {
+    if (!this.socket || !this.socket.connected) return;
+    if (!this.netSim.enabled || !this._shouldSimulateEvent(event)) {
+      this._emitNow(event, data, ack);
+      return;
+    }
+
+    this.netSimStats.sendTotal += 1;
+    const dropRate = this._clampNumber(this.netSim.send.dropRate, 0, 1, 0);
+    if (Math.random() < dropRate) {
+      this.netSimStats.sendDropped += 1;
+      return;
+    }
+
+    const delay = this._randomDelay(this.netSim.send.delayMs, this.netSim.send.jitterMs);
+    this.netSimStats.lastSendDelayMs = delay;
+    if (delay > 0) {
+      this.netSimStats.sendDelayed += 1;
+      setTimeout(() => {
+        this._emitNow(event, data, ack);
+      }, delay);
+      return;
+    }
+
+    this._emitNow(event, data, ack);
+  }
+
+  _getWrappedCallback(event, callback) {
+    if (!this.wrappedCallbacks.has(event)) {
+      this.wrappedCallbacks.set(event, new Map());
+    }
+    const m = this.wrappedCallbacks.get(event);
+    if (m.has(callback)) return m.get(callback);
+
+    const wrapped = (...args) => {
+      if (!this.netSim.enabled || !this._shouldSimulateEvent(event)) {
+        callback(...args);
+        return;
+      }
+
+      this.netSimStats.recvTotal += 1;
+      const dropRate = this._clampNumber(this.netSim.receive.dropRate, 0, 1, 0);
+      if (Math.random() < dropRate) {
+        this.netSimStats.recvDropped += 1;
+        return;
+      }
+
+      const delay = this._randomDelay(this.netSim.receive.delayMs, this.netSim.receive.jitterMs);
+      this.netSimStats.lastRecvDelayMs = delay;
+      if (delay > 0) {
+        this.netSimStats.recvDelayed += 1;
+        setTimeout(() => {
+          callback(...args);
+        }, delay);
+        return;
+      }
+
+      callback(...args);
+    };
+
+    m.set(callback, wrapped);
+    return wrapped;
+  }
+
+  initNetworkSimulation() {
+    if (this._netSimInitialized) return this.getNetworkSimulation();
+    this._netSimInitialized = true;
+
+    const next = {
+      enabled: false,
+      send: { dropRate: 0, delayMs: 0, jitterMs: 0 },
+      receive: { dropRate: 0, delayMs: 0, jitterMs: 0 }
+    };
+
+    // 1) localStorage（持久化配置）
+    try {
+      const raw = window?.localStorage?.getItem('QB_NETSIM');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          if (typeof parsed.enabled === 'boolean') next.enabled = parsed.enabled;
+          if (parsed.send && typeof parsed.send === 'object') {
+            next.send.dropRate = this._clampNumber(parsed.send.dropRate, 0, 1, 0);
+            next.send.delayMs = this._clampNumber(parsed.send.delayMs, 0, 60000, 0);
+            next.send.jitterMs = this._clampNumber(parsed.send.jitterMs, 0, 60000, 0);
+          }
+          if (parsed.receive && typeof parsed.receive === 'object') {
+            next.receive.dropRate = this._clampNumber(parsed.receive.dropRate, 0, 1, 0);
+            next.receive.delayMs = this._clampNumber(parsed.receive.delayMs, 0, 60000, 0);
+            next.receive.jitterMs = this._clampNumber(parsed.receive.jitterMs, 0, 60000, 0);
+          }
+        }
+      }
+    } catch {
+      // localStorage 或 JSON 解析失败时，直接忽略（不影响主功能）
+    }
+
+    // 2) URL 参数（临时覆盖，便于演示/复现实验）
+    try {
+      const params = new URLSearchParams(window?.location?.search || '');
+      const flag = params.get('netsim') || params.get('netSim') || params.get('qb_netsim');
+      if (this._truthyFlag(flag)) next.enabled = true;
+      if (['0', 'false', 'no', 'off'].includes(String(flag || '').trim().toLowerCase())) next.enabled = false;
+
+      const dropBoth = params.get('netsimDrop') || params.get('netSimDrop') || params.get('drop');
+      const delayBoth = params.get('netsimDelay') || params.get('netSimDelay') || params.get('delay');
+      const jitterBoth = params.get('netsimJitter') || params.get('netSimJitter') || params.get('jitter');
+
+      const sendDrop = params.get('netsimSendDrop') || params.get('sendDrop');
+      const recvDrop = params.get('netsimRecvDrop') || params.get('recvDrop');
+      const sendDelay = params.get('netsimSendDelay') || params.get('sendDelay');
+      const recvDelay = params.get('netsimRecvDelay') || params.get('recvDelay');
+      const sendJitter = params.get('netsimSendJitter') || params.get('sendJitter');
+      const recvJitter = params.get('netsimRecvJitter') || params.get('recvJitter');
+
+      if (dropBoth != null) {
+        const v = this._clampNumber(dropBoth, 0, 1, next.send.dropRate);
+        next.send.dropRate = v;
+        next.receive.dropRate = v;
+      }
+      if (delayBoth != null) {
+        const v = this._clampNumber(delayBoth, 0, 60000, next.send.delayMs);
+        next.send.delayMs = v;
+        next.receive.delayMs = v;
+      }
+      if (jitterBoth != null) {
+        const v = this._clampNumber(jitterBoth, 0, 60000, next.send.jitterMs);
+        next.send.jitterMs = v;
+        next.receive.jitterMs = v;
+      }
+
+      if (sendDrop != null) next.send.dropRate = this._clampNumber(sendDrop, 0, 1, next.send.dropRate);
+      if (recvDrop != null) next.receive.dropRate = this._clampNumber(recvDrop, 0, 1, next.receive.dropRate);
+      if (sendDelay != null) next.send.delayMs = this._clampNumber(sendDelay, 0, 60000, next.send.delayMs);
+      if (recvDelay != null) next.receive.delayMs = this._clampNumber(recvDelay, 0, 60000, next.receive.delayMs);
+      if (sendJitter != null) next.send.jitterMs = this._clampNumber(sendJitter, 0, 60000, next.send.jitterMs);
+      if (recvJitter != null) next.receive.jitterMs = this._clampNumber(recvJitter, 0, 60000, next.receive.jitterMs);
+
+      // 如果用户明确传了 netsim 参数，认为他希望“本次会话也记住”，方便刷新继续复现。
+      if (flag != null) {
+        try {
+          window?.localStorage?.setItem('QB_NETSIM', JSON.stringify(next));
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      // URL 不可用时忽略（例如某些测试环境）
+    }
+
+    this.netSim = next;
+    return this.getNetworkSimulation();
+  }
+
+  setNetworkSimulation(config) {
+    const c = config && typeof config === 'object' ? config : {};
+    const next = {
+      enabled: typeof c.enabled === 'boolean' ? c.enabled : !!this.netSim.enabled,
+      send: {
+        dropRate: this._clampNumber(c.send && c.send.dropRate, 0, 1, this.netSim.send.dropRate),
+        delayMs: this._clampNumber(c.send && c.send.delayMs, 0, 60000, this.netSim.send.delayMs),
+        jitterMs: this._clampNumber(c.send && c.send.jitterMs, 0, 60000, this.netSim.send.jitterMs)
+      },
+      receive: {
+        dropRate: this._clampNumber(c.receive && c.receive.dropRate, 0, 1, this.netSim.receive.dropRate),
+        delayMs: this._clampNumber(c.receive && c.receive.delayMs, 0, 60000, this.netSim.receive.delayMs),
+        jitterMs: this._clampNumber(c.receive && c.receive.jitterMs, 0, 60000, this.netSim.receive.jitterMs)
+      }
+    };
+    this.netSim = next;
+    try {
+      window?.localStorage?.setItem('QB_NETSIM', JSON.stringify(next));
+    } catch {
+      // ignore
+    }
+    return this.getNetworkSimulation();
+  }
+
+  getNetworkSimulation() {
+    const c = this.netSim || {};
+    return {
+      enabled: !!c.enabled,
+      send: { ...(c.send || {}) },
+      receive: { ...(c.receive || {}) }
+    };
+  }
+
+  getNetworkSimulationStats() {
+    return { ...(this.netSimStats || {}) };
+  }
+
+  resetNetworkSimulationStats() {
+    this.netSimStats = {
+      sendTotal: 0,
+      sendDropped: 0,
+      sendDelayed: 0,
+      recvTotal: 0,
+      recvDropped: 0,
+      recvDelayed: 0,
+      lastSendDelayMs: 0,
+      lastRecvDelayMs: 0
+    };
   }
 
   /**
@@ -21,6 +288,7 @@ class SocketService {
    * @param {string} roomId - 要加入的房间 ID（用于初次连接和后续重连）
    */
   connect(room) {
+    this.initNetworkSimulation();
     if (room && typeof room === 'object') {
       if (room.roomId) this.roomId = room.roomId;
       if (typeof room.userName === 'string') this.userName = room.userName;
@@ -44,7 +312,7 @@ class SocketService {
       // 这样业务层可以放心先 on(...)，再 connect(...)。
       for (const [event, callbacks] of this.callbacks.entries()) {
         for (const cb of callbacks) {
-          this.socket.on(event, cb);
+          this.socket.on(event, this._getWrappedCallback(event, cb));
         }
       }
 
@@ -125,7 +393,7 @@ class SocketService {
       if (this.userName) payloadObj.userName = this.userName;
       if (this.clientVersion > 0) payloadObj.clientVersion = this.clientVersion;
       const payload = Object.keys(payloadObj).length > 1 ? payloadObj : this.roomId;
-      this.socket.emit('join-room', payload);
+      this._emitWithSimulation('join-room', payload);
     }
   }
 
@@ -136,7 +404,7 @@ class SocketService {
    */
   emit(event, data) {
     if (this.socket && this.socket.connected) {
-      this.socket.emit(event, data);
+      this._emitWithSimulation(event, data);
     }
   }
 
@@ -151,7 +419,7 @@ class SocketService {
     }
     this.callbacks.get(event).add(callback);
     if (this.socket) {
-      this.socket.on(event, callback);
+      this.socket.on(event, this._getWrappedCallback(event, callback));
     }
   }
 
@@ -162,12 +430,20 @@ class SocketService {
    */
   off(event, callback) {
     if (this.socket) {
-      this.socket.off(event, callback);
+      const m = this.wrappedCallbacks.get(event);
+      const wrapped = m && m.get(callback);
+      this.socket.off(event, wrapped || callback);
     }
     if (this.callbacks.has(event)) {
       this.callbacks.get(event).delete(callback);
       if (this.callbacks.get(event).size === 0) {
         this.callbacks.delete(event);
+      }
+    }
+    if (this.wrappedCallbacks.has(event)) {
+      this.wrappedCallbacks.get(event).delete(callback);
+      if (this.wrappedCallbacks.get(event).size === 0) {
+        this.wrappedCallbacks.delete(event);
       }
     }
   }
@@ -190,7 +466,7 @@ class SocketService {
         resolve({ ok: false, error: 'TIMEOUT' });
       }, timeoutMs);
 
-      this.socket.emit(event, data, (resp) => {
+      this._emitWithSimulation(event, data, (resp) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
