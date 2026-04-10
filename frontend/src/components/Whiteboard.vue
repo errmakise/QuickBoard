@@ -6,12 +6,74 @@ import katex from 'katex';
 import socketService from '../services/socket'; // 引入 Socket 服务
 import crdtManager from '../utils/crdt/CRDTManager'; // 引入 CRDT 管理器
 import historyManager, { AddCommand, RemoveCommand, ModifyCommand } from '../utils/History'; // 引入历史记录管理器
+import { createGhostBrushSender, downsamplePointsKeepTail, normalizeGhostBrushPayload } from '../utils/ghostBrush';
 
 // --- 状态变量 ---
 const isDev = import.meta.env?.DEV === true;
 const canvasEl = ref(null); // 对应 <canvas ref="canvasEl">
 let canvas = null; // 存放 Fabric Canvas 实例 (注意：不要用 ref 包裹它！)
 const objectMap = new Map(); // id -> fabricObject (用于快速查找)
+let urlSearchParams = null;
+try {
+  urlSearchParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
+} catch {
+  urlSearchParams = new URLSearchParams();
+}
+const getUrlParam = (key) => {
+  try {
+    return urlSearchParams.get(key);
+  } catch {
+    return null;
+  }
+};
+const renderPerfMode = isDev && getUrlParam('renderPerf') === '1';
+const renderOptBaseline = getUrlParam('renderOpt') === 'baseline';
+const renderSkipOffscreenDefault = renderOptBaseline ? false : true;
+const renderObjectCachingDefault = renderOptBaseline ? false : true;
+const renderSkipOffscreenEnabled = getUrlParam('skipOffscreen') == null
+  ? renderSkipOffscreenDefault
+  : getUrlParam('skipOffscreen') !== '0';
+const renderObjectCachingEnabled = getUrlParam('objectCaching') == null
+  ? renderObjectCachingDefault
+  : getUrlParam('objectCaching') !== '0';
+let renderPerfOverride = null;
+const getActiveRenderPerfConfig = () => {
+  const override = renderPerfOverride && typeof renderPerfOverride === 'object' ? renderPerfOverride : null;
+  return {
+    skipOffscreen: override && typeof override.skipOffscreen === 'boolean' ? override.skipOffscreen : renderSkipOffscreenEnabled,
+    objectCaching: override && typeof override.objectCaching === 'boolean' ? override.objectCaching : renderObjectCachingEnabled
+  };
+};
+const applyRenderPerfConfigToCanvas = () => {
+  if (!canvas) return;
+  const cfg = getActiveRenderPerfConfig();
+  canvas.skipOffscreen = cfg.skipOffscreen;
+};
+const applyRenderPerfDefaultsToObject = (obj) => {
+  if (!obj) return;
+  if (obj.__isGhost === true) return;
+  if (obj.__draftShape === true) return;
+  const cfg = getActiveRenderPerfConfig();
+  if (typeof cfg.objectCaching === 'boolean') {
+    obj.objectCaching = cfg.objectCaching;
+    obj.dirty = true;
+  }
+};
+let lastActiveObjectForCaching = null;
+const syncActiveObjectCaching = () => {
+  if (!canvas) return;
+  const cfg = getActiveRenderPerfConfig();
+  if (lastActiveObjectForCaching && lastActiveObjectForCaching !== canvas.getActiveObject?.()) {
+    applyRenderPerfDefaultsToObject(lastActiveObjectForCaching);
+    lastActiveObjectForCaching = null;
+  }
+  const active = typeof canvas.getActiveObject === 'function' ? canvas.getActiveObject() : null;
+  if (active) {
+    lastActiveObjectForCaching = active;
+    active.objectCaching = false;
+    active.dirty = true;
+  }
+};
 // Socket 连接状态（用于 UI 展示；不参与协同逻辑）
 // - connecting: 正在建立连接/重连中
 // - connected: 连接已建立
@@ -900,6 +962,325 @@ let lastPanClientX = 0;
 let lastPanClientY = 0;
 const MIN_ZOOM = 0.2;
 const MAX_ZOOM = 4;
+let viewportStatsRafId = null;
+let lastViewportStats = {
+  totalObjects: 0,
+  visibleObjects: 0,
+  culledObjects: 0,
+  computeMs: 0
+};
+
+const getWorldViewportRect = () => {
+  if (!canvas) return { left: 0, top: 0, right: 0, bottom: 0, zoom: 1 };
+  const zoom = canvas.getZoom ? canvas.getZoom() : 1;
+  const w = typeof canvas.getWidth === 'function' ? canvas.getWidth() : window.innerWidth;
+  const h = typeof canvas.getHeight === 'function' ? canvas.getHeight() : window.innerHeight;
+  const vpt = canvas.viewportTransform || [1, 0, 0, 1, 0, 0];
+  const inv = fabric.util.invertTransform(vpt);
+  const p0 = fabric.util.transformPoint(new fabric.Point(0, 0), inv);
+  const p1 = fabric.util.transformPoint(new fabric.Point(w, h), inv);
+  const left = Math.min(p0.x, p1.x);
+  const right = Math.max(p0.x, p1.x);
+  const top = Math.min(p0.y, p1.y);
+  const bottom = Math.max(p0.y, p1.y);
+  return { left, top, right, bottom, zoom };
+};
+
+const rectIntersects = (a, b) =>
+  a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
+
+const computeViewportCullingStats = () => {
+  if (!canvas) {
+    lastViewportStats = { totalObjects: 0, visibleObjects: 0, culledObjects: 0, computeMs: 0 };
+    return lastViewportStats;
+  }
+  const t0 = performance.now();
+  const vp = getWorldViewportRect();
+  const marginWorld = 200 / (vp.zoom || 1);
+  const expandedVp = {
+    left: vp.left - marginWorld,
+    top: vp.top - marginWorld,
+    right: vp.right + marginWorld,
+    bottom: vp.bottom + marginWorld
+  };
+
+  const objs = typeof canvas.getObjects === 'function' ? canvas.getObjects() : [];
+  let total = 0;
+  let visible = 0;
+  for (const obj of objs) {
+    if (!obj) continue;
+    if (obj.__isGhost === true) continue;
+    if (obj.__draftShape === true) continue;
+    total += 1;
+    const br = typeof obj.getBoundingRect === 'function' ? obj.getBoundingRect(true, true) : null;
+    if (!br) {
+      visible += 1;
+      continue;
+    }
+    const r = { left: br.left, top: br.top, right: br.left + br.width, bottom: br.top + br.height };
+    if (rectIntersects(r, expandedVp)) {
+      visible += 1;
+    }
+  }
+  const t1 = performance.now();
+  lastViewportStats = {
+    totalObjects: total,
+    visibleObjects: visible,
+    culledObjects: Math.max(0, total - visible),
+    computeMs: t1 - t0
+  };
+  return lastViewportStats;
+};
+
+const scheduleViewportStatsUpdate = () => {
+  if (!renderPerfMode) return;
+  if (viewportStatsRafId) return;
+  viewportStatsRafId = requestAnimationFrame(() => {
+    viewportStatsRafId = null;
+    computeViewportCullingStats();
+  });
+};
+
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const createSeededRng = (seed) => {
+  let s = (seed >>> 0) || 1;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+};
+
+const clearCanvasForPerf = () => {
+  if (!canvas) return;
+  try {
+    canvas.discardActiveObject();
+  } catch {
+    void 0;
+  }
+  const objs = typeof canvas.getObjects === 'function' ? canvas.getObjects().slice() : [];
+  for (const obj of objs) {
+    try {
+      canvas.remove(obj);
+    } catch {
+      void 0;
+    }
+  }
+  canvas.requestRenderAll();
+  objectMap.clear();
+  historyManager.reset();
+  crdtManager.reset();
+};
+
+const generatePerfSceneObjects = async ({ count, worldSize, seed }) => {
+  if (!canvas) return { added: 0 };
+  const rng = createSeededRng(seed);
+  const prev = canvas.renderOnAddRemove;
+  canvas.renderOnAddRemove = false;
+  let added = 0;
+
+  for (let i = 0; i < count; i += 1) {
+    const x = Math.floor(rng() * worldSize);
+    const y = Math.floor(rng() * worldSize);
+    const w = 20 + Math.floor(rng() * 60);
+    const h = 20 + Math.floor(rng() * 60);
+    const fill = `hsl(${Math.floor(rng() * 360)}, 65%, 60%)`;
+    const obj = new fabric.Rect({
+      left: x,
+      top: y,
+      width: w,
+      height: h,
+      fill,
+      stroke: 'rgba(0,0,0,0.08)',
+      strokeWidth: 1,
+      selectable: false,
+      evented: false
+    });
+    obj.__fromRemote = true;
+    applyRenderPerfDefaultsToObject(obj);
+    canvas.add(obj);
+    delete obj.__fromRemote;
+    added += 1;
+  }
+
+  canvas.renderOnAddRemove = prev;
+  canvas.requestRenderAll();
+  await sleepMs(50);
+  return { added };
+};
+
+const runCanvasPerfLoop = async ({ durationMs, step }) => {
+  if (!canvas) return { samples: [] };
+  let rafId = null;
+  let running = true;
+
+  let lastSecondAt = performance.now();
+  let frameCount = 0;
+  let renderStartAt = 0;
+  let renderSum = 0;
+  let renderCount = 0;
+  let renderMax = 0;
+  let lastElapsed = 0;
+
+  const samples = [];
+
+  const beforeRender = () => {
+    renderStartAt = performance.now();
+  };
+  const afterRender = () => {
+    const d = performance.now() - renderStartAt;
+    renderSum += d;
+    renderCount += 1;
+    renderMax = Math.max(renderMax, d);
+  };
+
+  canvas.on('before:render', beforeRender);
+  canvas.on('after:render', afterRender);
+
+  const startAt = performance.now();
+
+  const tick = (t) => {
+    if (!running) return;
+    const elapsed = t - startAt;
+    lastElapsed = elapsed;
+    if (elapsed >= durationMs) {
+      running = false;
+      return;
+    }
+
+    frameCount += 1;
+    if (typeof step === 'function') step(t, elapsed);
+    canvas.requestRenderAll();
+
+    const dt = t - lastSecondAt;
+    if (dt >= 1000) {
+      const fps = (frameCount * 1000) / dt;
+      const vpStats = computeViewportCullingStats();
+      const avgRenderMs = renderCount ? renderSum / renderCount : 0;
+      samples.push({
+        tMs: Math.round(elapsed),
+        fps,
+        avgRenderMs,
+        maxRenderMs: renderMax,
+        totalObjects: vpStats.totalObjects,
+        visibleObjects: vpStats.visibleObjects,
+        culledObjects: vpStats.culledObjects,
+        cullComputeMs: vpStats.computeMs
+      });
+      frameCount = 0;
+      renderSum = 0;
+      renderCount = 0;
+      renderMax = 0;
+      lastSecondAt = t;
+    }
+
+    rafId = requestAnimationFrame(tick);
+  };
+
+  rafId = requestAnimationFrame(tick);
+
+  const endAt = startAt + durationMs + 200;
+  while (running && performance.now() < endAt) {
+    await sleepMs(50);
+  }
+
+  if (rafId) cancelAnimationFrame(rafId);
+  const finalDt = performance.now() - lastSecondAt;
+  if (finalDt > 0 && (frameCount > 0 || renderCount > 0)) {
+    const fps = (frameCount * 1000) / finalDt;
+    const vpStats = computeViewportCullingStats();
+    const avgRenderMs = renderCount ? renderSum / renderCount : 0;
+    samples.push({
+      tMs: Math.round(Math.min(durationMs, lastElapsed)),
+      fps,
+      avgRenderMs,
+      maxRenderMs: renderMax,
+      totalObjects: vpStats.totalObjects,
+      visibleObjects: vpStats.visibleObjects,
+      culledObjects: vpStats.culledObjects,
+      cullComputeMs: vpStats.computeMs
+    });
+  }
+  canvas.off('before:render', beforeRender);
+  canvas.off('after:render', afterRender);
+
+  return { samples };
+};
+
+const runRenderPerfBenchmark = async () => {
+  if (!canvas) return null;
+  const countRaw = getUrlParam('perfObjects');
+  const worldRaw = getUrlParam('perfWorld');
+  const seedRaw = getUrlParam('perfSeed');
+  const objectCount = countRaw && Number.isFinite(Number(countRaw)) ? Math.max(100, Math.floor(Number(countRaw))) : 5000;
+  const worldSize = worldRaw && Number.isFinite(Number(worldRaw)) ? Math.max(2000, Math.floor(Number(worldRaw))) : 6000;
+  const seed = seedRaw && Number.isFinite(Number(seedRaw)) ? Math.floor(Number(seedRaw)) : 42;
+
+  clearCanvasForPerf();
+  canvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
+  canvas.setZoom(1);
+  canvas.requestRenderAll();
+  await sleepMs(50);
+
+  const scene = await generatePerfSceneObjects({ count: objectCount, worldSize, seed });
+
+  const runOne = async (mode) => {
+    renderPerfOverride = mode === 'baseline'
+      ? { skipOffscreen: false, objectCaching: false }
+      : { skipOffscreen: true, objectCaching: true };
+    applyRenderPerfConfigToCanvas();
+    const objs = typeof canvas.getObjects === 'function' ? canvas.getObjects() : [];
+    for (const obj of objs) {
+      applyRenderPerfDefaultsToObject(obj);
+    }
+    canvas.requestRenderAll();
+    await sleepMs(80);
+
+    const idle = await runCanvasPerfLoop({ durationMs: 2500 });
+    const pan = await runCanvasPerfLoop({
+      durationMs: 2500,
+      step: () => {
+        const vpt = canvas.viewportTransform;
+        if (!vpt) return;
+        vpt[4] -= 2.2;
+        vpt[5] -= 1.4;
+        canvas.setViewportTransform(vpt);
+      }
+    });
+    const zoom = await runCanvasPerfLoop({
+      durationMs: 2500,
+      step: (t) => {
+        const z = 0.7 + 0.6 * (0.5 + 0.5 * Math.sin(t / 260));
+        const center = canvas.getCenter();
+        canvas.zoomToPoint(new fabric.Point(center.left, center.top), z);
+      }
+    });
+
+    return { mode, phases: { idle, pan, zoom } };
+  };
+
+  const baseline = await runOne('baseline');
+  const optimized = await runOne('optimized');
+
+  renderPerfOverride = null;
+  applyRenderPerfConfigToCanvas();
+
+  const report = {
+    kind: 'quickboard-render-perf',
+    createdAt: new Date().toISOString(),
+    params: { objectCount, worldSize, seed },
+    scene,
+    results: { baseline, optimized }
+  };
+
+  try {
+    window.__qbRenderPerfReport = report;
+  } catch {
+    void 0;
+  }
+  console.log(`QB_RENDER_PERF_REPORT:${JSON.stringify(report)}`);
+  return report;
+};
 
 // 生成唯一ID
 const generateId = () => crypto.randomUUID();
@@ -952,6 +1333,7 @@ onMounted(() => {
     backgroundColor: 'rgba(255,255,255,0)',
   });
   canvas = fabricCanvas;
+  applyRenderPerfConfigToCanvas();
   if (isDev) {
     window.__canvas = canvas;
   }
@@ -1107,6 +1489,9 @@ onMounted(() => {
   canvas.on('selection:created', refreshSelectedFormula);
   canvas.on('selection:updated', refreshSelectedFormula);
   canvas.on('selection:cleared', refreshSelectedFormula);
+  canvas.on('selection:created', syncActiveObjectCaching);
+  canvas.on('selection:updated', syncActiveObjectCaching);
+  canvas.on('selection:cleared', syncActiveObjectCaching);
 
   // 鼠标滚轮缩放（只影响本地视图，不影响协同数据）
   canvas.on('mouse:wheel', handleCanvasMouseWheel);
@@ -1164,12 +1549,7 @@ onMounted(() => {
 
     if (canvas.isDrawingMode && (isMouseDown || e.e.buttons === 1)) {
       // console.log('✏️ Emit drawing:', pointer.x, pointer.y);
-      socketService.emit('drawing-process', {
-        roomId: ROOM_ID,
-        x: pointer.x,
-        y: pointer.y,
-        isEnd: false
-      });
+      ghostBrushSender.enqueuePoint(pointer.x, pointer.y);
     }
   });
 
@@ -1234,26 +1614,26 @@ onMounted(() => {
 
   // 监听绘图结束，发送一个结束信号 (Ghost Brush)
   canvas.on('path:created', (e) => {
-    // 仅用于结束远程的 Ghost 绘制状态
-    socketService.emit('drawing-process', {
-      roomId: ROOM_ID,
-      isEnd: true
-    });
-
     // 自由画笔路径在某些版本下 object:added 时机不稳定，这里在 path:created 明确入栈与广播
     const pathObj = e && (e.path || e.target);
-    if (!pathObj) return;
+    // 跳过远端创建的对象：远端不应该再给“更远端”发送自己的 Ghost End
+    if (pathObj && pathObj.__fromRemote === true) return;
 
-    // 跳过远端创建的对象
-    if (pathObj.__fromRemote === true) return;
+    // 仅用于结束远程的 Ghost 绘制状态（本地用户画完一笔时发送）
+    // 注意：这里会先 flush 一次缓存点，避免“尾点还在队列里没来得及发”就直接 isEnd 导致远端断笔
+    ghostBrushSender.endStroke();
+
+    if (!pathObj) return;
 
     // 确保有 ID
     if (!pathObj.id) {
       pathObj.id = generateId();
     }
+    applyRenderPerfDefaultsToObject(pathObj);
 
     // 记录到 Map，方便后续撤销查找
     objectMap.set(pathObj.id, pathObj);
+    scheduleViewportStatsUpdate();
 
     const rollbackLocalCreatedPath = () => {
       canvas.remove(pathObj);
@@ -1325,9 +1705,11 @@ onMounted(() => {
     if (!obj.id) {
       obj.id = generateId();
     }
+    applyRenderPerfDefaultsToObject(obj);
 
     // 2. 存入 Map
     objectMap.set(obj.id, obj);
+    scheduleViewportStatsUpdate();
 
     // [关键修复] 如果是撤销/重做操作触发的添加，不要记录到历史记录中
     if (isUndoRedo) {
@@ -1402,7 +1784,12 @@ onMounted(() => {
   });
 
   // 6. 初始化 Socket 连接 (移到最后，确保 canvas 已就绪)
-  initSocket();
+  if (renderPerfMode) {
+    connectionState.value = 'disconnected';
+    void runRenderPerfBenchmark();
+  } else {
+    initSocket();
+  }
 });
 
 
@@ -1420,6 +1807,11 @@ onUnmounted(() => {
     clearInterval(netSimPollTimer);
     netSimPollTimer = null;
   }
+  if (viewportStatsRafId) {
+    cancelAnimationFrame(viewportStatsRafId);
+    viewportStatsRafId = null;
+  }
+  ghostBrushSender.dispose();
   cancelFormulaRecognize();
   void closeFormulaEditor(true);
   if (canvas) canvas.dispose();
@@ -1629,6 +2021,12 @@ const applyRoomClear = () => {
   suppressNextLocalPathCreated = false;
   isMouseDown = false;
 
+  // 清理 Ghost Brush 的临时对象与渲染句柄（避免 rAF 回调在 reset 后继续跑）
+  for (const [, pathData] of ghostPaths.entries()) {
+    if (!pathData) continue;
+    if (pathData.rafId) cancelAnimationFrame(pathData.rafId);
+    if (pathData.tempLine) canvas.remove(pathData.tempLine);
+  }
   ghostPaths.clear();
 
   for (const userId of Array.from(cursorMap.keys())) {
@@ -1657,6 +2055,11 @@ const applyRoomClear = () => {
  * - Top context（Fabric 的上层临时绘制层）
  */
 const cleanupEphemeralState = () => {
+  for (const [, pathData] of ghostPaths.entries()) {
+    if (!pathData) continue;
+    if (pathData.rafId) cancelAnimationFrame(pathData.rafId);
+    if (pathData.tempLine && canvas) canvas.remove(pathData.tempLine);
+  }
   ghostPaths.clear();
 
   for (const userId of Array.from(cursorMap.keys())) {
@@ -2136,59 +2539,111 @@ const insertFormula = () => {
 // --- 方法：处理本地鼠标移动 (节流发送) ---
 let lastCursorSend = 0;
 
+// --- Ghost Brush：发送端降载（批量点发送）---
+//
+// 给外行看的解释：
+// - 鼠标移动事件（mousemove）非常高频：一秒几十到上百次；
+// - 如果我们“每个 mousemove 都发一个 drawing-process 消息”，多人同时画就会造成网络风暴；
+// - 所以这里把点先缓存起来，再按固定节奏（例如 33ms≈30fps）批量发出去：
+//   - 视觉上仍然跟手
+//   - 网络消息数量会大幅下降
+const ghostBrushSender = createGhostBrushSender({
+  emit: (event, payload) => socketService.emit(event, payload),
+  roomId: ROOM_ID,
+  flushIntervalMs: 33,
+  maxPendingPoints: 300,
+  maxPointsPerMessage: 60
+});
+
 // --- 方法：渲染远程 Ghost Path ---
-// 存储每个用户的临时路径点: userId -> [{x,y}, {x,y}...]
+// 存储每个用户的临时路径点与渲染句柄：
+// - points：世界坐标点集（仅用于临时预览，不进入 CRDT）
+// - tempLine：fabric.Polyline 临时对象（excludeFromExport）
+// - rafId：合帧渲染句柄（同一帧多点只渲染一次）
 const ghostPaths = new Map();
 
-const renderGhostPath = ({ userId, x, y, isEnd }) => {
-  // 1. 如果是结束信号，清除临时路径
+const GHOST_BRUSH_MAX_POINTS = 3000;
+
+const scheduleGhostRender = (userId, pathData) => {
+  if (!canvas) return;
+  if (!pathData) return;
+  if (pathData.rafId) return;
+
+  pathData.rafId = requestAnimationFrame(() => {
+    pathData.rafId = 0;
+    if (!pathData.dirty) return;
+    pathData.dirty = false;
+
+    if (!pathData.tempLine) {
+      const polyline = new fabric.Polyline(pathData.points, {
+        stroke: 'rgba(50, 50, 50, 0.8)', // Ghost 预览线：灰黑色，避免和正式笔迹混淆
+        strokeWidth: 4,
+        fill: 'transparent',
+        strokeLineCap: 'round',
+        strokeLineJoin: 'round',
+        evented: false,
+        selectable: false,
+        hoverCursor: 'default'
+      });
+      polyline.__isGhost = true;
+      polyline.__ghostOwner = userId;
+      polyline.excludeFromExport = true;
+      pathData.tempLine = polyline;
+      canvas.add(polyline);
+      canvas.requestRenderAll();
+      return;
+    }
+
+    // 性能关键点：
+    // - 旧实现：每个点都 remove + new + add（会触发大量对象管理与重绘）
+    // - 新实现：同一帧把点合并后只更新一次 points 并 requestRenderAll
+    pathData.tempLine.set({ points: pathData.points });
+    if (typeof pathData.tempLine.setCoords === 'function') {
+      pathData.tempLine.setCoords();
+    }
+    canvas.requestRenderAll();
+  });
+};
+
+const renderGhostPath = (raw) => {
+  const { userId, isEnd, points } = normalizeGhostBrushPayload(raw);
+  if (!userId) return;
+
+  // 1) 结束信号：清除该用户的临时预览线
   if (isEnd) {
     const pathData = ghostPaths.get(userId);
     if (pathData) {
-      if (pathData.tempLine) {
-        canvas.remove(pathData.tempLine);
-      }
+      if (pathData.rafId) cancelAnimationFrame(pathData.rafId);
+      if (pathData.tempLine) canvas.remove(pathData.tempLine);
       ghostPaths.delete(userId);
       canvas.requestRenderAll();
     }
     return;
   }
 
-  // 2. 如果是新的点，添加到路径
+  // 2) 批量点：追加到 points
+  if (!points || points.length === 0) return;
+
   let pathData = ghostPaths.get(userId);
   if (!pathData) {
-    pathData = { points: [], tempLine: null };
+    pathData = { points: [], tempLine: null, rafId: 0, dirty: false };
     ghostPaths.set(userId, pathData);
   }
 
-  pathData.points.push({ x, y });
+  pathData.points.push(...points);
 
-  // 3. 绘制/更新线段
-  // 如果点太少，不画
-  if (pathData.points.length < 2) return;
-
-  // 移除旧线 (性能优化：实际应该更新 path data 而不是重建，但 fabric v6 更新 path 比较复杂)
-  // 为了简单且高性能，我们用 Polyline
-  if (pathData.tempLine) {
-    canvas.remove(pathData.tempLine);
+  // 3) 点数上限：避免极端情况下点集无限增长（例如某端卡住一直不收到 isEnd）
+  if (pathData.points.length > GHOST_BRUSH_MAX_POINTS) {
+    const compact = downsamplePointsKeepTail(
+      pathData.points.map((p) => [p.x, p.y]),
+      GHOST_BRUSH_MAX_POINTS
+    );
+    pathData.points = compact.map(([x, y]) => ({ x, y }));
   }
 
-  const polyline = new fabric.Polyline(pathData.points, {
-    stroke: 'rgba(50, 50, 50, 0.8)', // 黑色，更明显
-    strokeWidth: 4, // 加粗
-    fill: 'transparent',
-    strokeLineCap: 'round',
-    strokeLineJoin: 'round',
-    evented: false, // 不能被选中
-    selectable: false,
-    hoverCursor: 'default'
-  });
-  polyline.__isGhost = true;
-  polyline.excludeFromExport = true;
-
-  pathData.tempLine = polyline;
-  canvas.add(polyline);
-  canvas.requestRenderAll();
+  if (pathData.points.length < 2) return;
+  pathData.dirty = true;
+  scheduleGhostRender(userId, pathData);
 };
 
 // --- 方法：更新远程光标 ---
@@ -2350,6 +2805,7 @@ const handleRemoteUpdate = (crdtState) => {
         if (isFormulaObject(obj)) {
           obj.editable = false;
         }
+        applyRenderPerfDefaultsToObject(obj);
         objectMap.set(obj.id, obj);
         canvas.add(obj);
         // 下一拍移除标记
@@ -2358,6 +2814,7 @@ const handleRemoteUpdate = (crdtState) => {
         }, 0);
       });
       canvas.renderAll();
+      scheduleViewportStatsUpdate();
       isRemoteUpdate = false;
     });
   } else {
@@ -2369,7 +2826,9 @@ const handleRemoteUpdate = (crdtState) => {
         obj.editable = false;
       }
       obj.setCoords(); // 更新坐标控制点
+      applyRenderPerfDefaultsToObject(obj);
       canvas.requestRenderAll();
+      scheduleViewportStatsUpdate();
     }
     isRemoteUpdate = false;
   }
@@ -2383,6 +2842,7 @@ const handleResize = () => {
     canvas.setWidth(window.innerWidth);
     canvas.setHeight(window.innerHeight);
     canvas.renderAll();
+    scheduleViewportStatsUpdate();
   }
 };
 
@@ -2484,6 +2944,7 @@ const handleCanvasMouseWheel = (e) => {
   canvas.zoomToPoint(zoomPoint, zoom);
 
   refreshRemoteCursors();
+  scheduleViewportStatsUpdate();
 };
 
 /**
@@ -2541,6 +3002,7 @@ const resetView = () => {
   canvas.setZoom(1);
   canvas.requestRenderAll();
   refreshRemoteCursors();
+  scheduleViewportStatsUpdate();
 };
 
 const zoomIn = () => zoomByFactor(1.1);
@@ -2588,6 +3050,7 @@ const handleCanvasPanMove = (e) => {
     canvas.setViewportTransform(vpt);
     canvas.requestRenderAll();
     refreshRemoteCursors();
+    scheduleViewportStatsUpdate();
   }
 
   return true;

@@ -10,6 +10,11 @@ require('dotenv').config();
 
 const app = express();
 
+const SYNC_MODE = String(process.env.SYNC_MODE || '').trim().toLowerCase();
+const SYNC_MODE_NAIVE = SYNC_MODE === 'naive';
+const BENCH_PASS_THROUGH = String(process.env.BENCH_PASS_THROUGH || '').trim().toLowerCase();
+const BENCH_PASS_THROUGH_ENABLED = BENCH_PASS_THROUGH === '1' || BENCH_PASS_THROUGH === 'true' || BENCH_PASS_THROUGH === 'yes';
+
 // 服务端“纪元”（epoch）：用于区分“同一个房间版本号体系”的生命周期。
 // 给外行看的解释：
 // - 我们的 serverVersion 是内存里递增的计数器，服务端一旦重启，它会从 0 重新开始；
@@ -128,8 +133,197 @@ const roomCleanupSeconds = !roomCleanupRaw
   : (Number.isFinite(Number(roomCleanupRaw)) ? Math.max(5, Number(roomCleanupRaw)) : 60);
 const ROOM_CLEANUP_INTERVAL_MS = roomCleanupSeconds * 1000;
 
-// [关键修复] 状态持久化文件路径
+// --- 状态持久化（roomStates.json）---
+//
+// 给外行看的解释：
+// - 我们在内存里维护 roomStates（每个房间的 CRDT/LWW 状态）；
+// - 只有放在内存里有两个问题：
+//   1) 服务端重启后数据会丢：新加入者就拿不到历史内容；
+//   2) 进程异常退出时也会丢最后一段变更；
+// - 因此我们把 roomStates 持久化到一个 JSON 文件（roomStates.json）。
+//
+// 但“怎么写这个文件”很关键：
+// - 如果每次 draw-event 都同步写文件（writeFileSync），会阻塞 Node 事件循环；
+//   画得越快、房间越大，就越容易出现延迟抖动/卡顿。
+// - 如果在写文件过程中进程被杀，可能留下半截 JSON，导致下次启动解析失败。
+//
+// 本次改造目标：
+// - 防抖批量落盘：把 N 次变更合并成 1 次写盘；
+// - 安全替换：先写临时文件，再替换主文件，降低写坏风险；
+// - 并发保护：同一时间只允许一个写入任务。
 const STATE_FILE = path.join(__dirname, 'roomStates.json');
+const STATE_FILE_TMP = `${STATE_FILE}.tmp`;
+const STATE_FILE_BAK = `${STATE_FILE}.bak`;
+
+function parseBooleanEnv(name, defaultValue) {
+  const raw = String(process.env[name] || '').trim().toLowerCase();
+  if (!raw) return defaultValue;
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
+  if (['0', 'false', 'no', 'off'].includes(raw)) return false;
+  return defaultValue;
+}
+
+const ROOM_STATE_PERSIST_DEBUG = parseBooleanEnv('ROOM_STATE_PERSIST_DEBUG', false);
+const DRAW_EVENT_DEBUG = parseBooleanEnv('DRAW_EVENT_DEBUG', false);
+
+const stateSaveDebounceRaw = String(process.env.ROOM_STATE_SAVE_DEBOUNCE_MS || '').trim();
+const ROOM_STATE_SAVE_DEBOUNCE_MS = Number.isFinite(Number(stateSaveDebounceRaw))
+  ? Math.max(50, Math.min(5000, Number(stateSaveDebounceRaw)))
+  : 600;
+
+const ROOM_STATE_PRETTY_JSON = parseBooleanEnv('ROOM_STATE_PRETTY_JSON', false);
+
+function persistDebugLog(...args) {
+  if (!ROOM_STATE_PERSIST_DEBUG) return;
+  console.log('[Persist]', ...args);
+}
+
+let saveTimer = null;
+let saveInFlight = false;
+let savePending = false;
+let saveDirty = false;
+let lastSaveRequestAt = 0;
+
+function buildRoomStatesJson() {
+  return JSON.stringify(roomStates, null, ROOM_STATE_PRETTY_JSON ? 2 : 0);
+}
+
+function persistRoomStatesToDiskSync(reason) {
+  try {
+    const startedAt = Date.now();
+    const json = buildRoomStatesJson();
+
+    fs.writeFileSync(STATE_FILE_TMP, json, 'utf8');
+
+    try {
+      if (fs.existsSync(STATE_FILE)) {
+        try {
+          if (fs.existsSync(STATE_FILE_BAK)) fs.unlinkSync(STATE_FILE_BAK);
+        } catch {
+          // ignore
+        }
+        fs.renameSync(STATE_FILE, STATE_FILE_BAK);
+      }
+    } catch {
+      // ignore
+    }
+
+    fs.renameSync(STATE_FILE_TMP, STATE_FILE);
+
+    try {
+      if (fs.existsSync(STATE_FILE_BAK)) fs.unlinkSync(STATE_FILE_BAK);
+    } catch {
+      // ignore
+    }
+
+    persistDebugLog('flush sync ok', { reason, bytes: Buffer.byteLength(json), ms: Date.now() - startedAt });
+    return true;
+  } catch (error) {
+    persistDebugLog('flush sync failed', { reason, error: String(error && error.message ? error.message : error) });
+    return false;
+  }
+}
+
+async function persistRoomStatesToDiskAsync(reason) {
+  const startedAt = Date.now();
+  const json = buildRoomStatesJson();
+  const bytes = Buffer.byteLength(json);
+
+  await fs.promises.writeFile(STATE_FILE_TMP, json, 'utf8');
+
+  try {
+    await fs.promises.rm(STATE_FILE_BAK, { force: true });
+  } catch {
+    // ignore
+  }
+
+  try {
+    await fs.promises.rename(STATE_FILE, STATE_FILE_BAK);
+  } catch {
+    // ignore (file may not exist on first run)
+  }
+
+  try {
+    await fs.promises.rename(STATE_FILE_TMP, STATE_FILE);
+  } catch (error) {
+    try {
+      if (fs.existsSync(STATE_FILE_BAK) && !fs.existsSync(STATE_FILE)) {
+        await fs.promises.rename(STATE_FILE_BAK, STATE_FILE);
+      }
+    } catch {
+      // ignore
+    }
+    throw error;
+  }
+
+  try {
+    await fs.promises.rm(STATE_FILE_BAK, { force: true });
+  } catch {
+    // ignore
+  }
+
+  persistDebugLog('flush async ok', { reason, bytes, ms: Date.now() - startedAt });
+}
+
+/**
+ * 请求一次“未来的落盘”（防抖）。
+ *
+ * 直觉理解：
+ * - 用户画画时会触发大量 draw-event；
+ * - 我们不希望每个事件都写硬盘，而是“最后一次变更过去一小段时间”才写一次；
+ * - 这样既能持久化，又能大幅降低 IO 与卡顿。
+ */
+function requestSaveStates(reason) {
+  saveDirty = true;
+  lastSaveRequestAt = Date.now();
+
+  if (saveTimer) clearTimeout(saveTimer);
+
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    flushSaveStates({ reason: reason || 'debounced' }).catch(() => {
+      // ignore (errors are logged in flushSaveStates)
+    });
+  }, ROOM_STATE_SAVE_DEBOUNCE_MS);
+}
+
+/**
+ * 立即执行一次落盘（如果有脏数据）。
+ *
+ * 注意：
+ * - 这是异步写入，不会像 writeFileSync 一样卡住事件循环；
+ * - 但 JSON.stringify 本身是同步的 CPU 操作，所以我们用“减少次数”的方式控制成本。
+ */
+async function flushSaveStates(options) {
+  const reason = options && options.reason ? options.reason : 'manual';
+
+  if (!saveDirty) return;
+
+  if (saveInFlight) {
+    savePending = true;
+    return;
+  }
+
+  saveInFlight = true;
+  savePending = false;
+  saveDirty = false;
+
+  const requestAgeMs = Date.now() - lastSaveRequestAt;
+  try {
+    await persistRoomStatesToDiskAsync(reason);
+  } catch (error) {
+    console.error('[Server] Error saving states:', error);
+    saveDirty = true;
+  } finally {
+    saveInFlight = false;
+  }
+
+  if (savePending || saveDirty || (Date.now() - lastSaveRequestAt) < requestAgeMs) {
+    flushSaveStates({ reason: 'pending' }).catch(() => {
+      // ignore
+    });
+  }
+}
 
 /**
  * 判断一个对象数据是否是“Ghost Brush”临时预览线（不应进入持久化/初次同步/CRDT 状态）。
@@ -265,8 +459,29 @@ function sendDeltaSync(socket, roomId, fromVersion) {
 function loadStates() {
   try {
     if (fs.existsSync(STATE_FILE)) {
-      const data = fs.readFileSync(STATE_FILE, 'utf8');
-      const loadedStates = JSON.parse(data);
+      let data = fs.readFileSync(STATE_FILE, 'utf8');
+      let loadedStates = null;
+      try {
+        loadedStates = JSON.parse(data);
+      } catch (error) {
+        console.error('[Server] Error parsing roomStates.json, try fallback .bak:', error);
+        try {
+          if (fs.existsSync(STATE_FILE_BAK)) {
+            data = fs.readFileSync(STATE_FILE_BAK, 'utf8');
+            loadedStates = JSON.parse(data);
+            console.log('[Server] Loaded room states from .bak');
+          }
+        } catch (bakError) {
+          console.error('[Server] Error loading fallback .bak:', bakError);
+          loadedStates = null;
+        }
+      }
+
+      if (!loadedStates || typeof loadedStates !== 'object') {
+        console.error('[Server] Loaded room states is invalid, skip restore.');
+        return;
+      }
+
       Object.assign(roomStates, loadedStates);
       console.log('[Server] Loaded room states from file');
 
@@ -286,7 +501,7 @@ function loadStates() {
         }
       }
       if (mutated) {
-        saveStates();
+        persistRoomStatesToDiskSync('startup-cleanup');
       }
 
       const now = Date.now();
@@ -308,15 +523,23 @@ function loadStates() {
 // [关键修复] 启动时加载状态
 loadStates();
 
-// [关键修复] 保存状态到文件
-function saveStates() {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(roomStates, null, 2));
-    console.log('[Server] Saved room states to file');
-  } catch (error) {
-    console.error('[Server] Error saving states:', error);
+process.on('exit', () => {
+  if (saveDirty) {
+    persistRoomStatesToDiskSync('process-exit');
   }
-}
+});
+
+process.once('SIGINT', () => {
+  if (saveTimer) clearTimeout(saveTimer);
+  persistRoomStatesToDiskSync('SIGINT');
+  setTimeout(() => process.exit(0), 0);
+});
+
+process.once('SIGTERM', () => {
+  if (saveTimer) clearTimeout(saveTimer);
+  persistRoomStatesToDiskSync('SIGTERM');
+  setTimeout(() => process.exit(0), 0);
+});
 
 function cleanupExpiredLocks(roomId) {
   if (!roomId || !roomLocks[roomId]) return false;
@@ -423,7 +646,12 @@ function destroyRoom(roomId) {
   if (roomLastSnapshotVersion[roomId] != null) {
     delete roomLastSnapshotVersion[roomId];
   }
-  if (changed) saveStates();
+  if (changed) {
+    requestSaveStates('destroy-room');
+    flushSaveStates({ reason: 'destroy-room' }).catch(() => {
+      // ignore
+    });
+  }
   return changed;
 }
 
@@ -696,10 +924,12 @@ io.on('connection', (socket) => {
     // - 新加入者/首次进入：发全量快照（sync-state），因为客户端没有任何历史；
     // - 断线重连者：如果客户端带了 clientVersion，且服务端还有对应的增量日志，则只补缺失增量（sync-delta）；
     // - 兜底：当客户端版本太旧或服务端没日志，就退回全量快照，保证“一定能同步上”。
-    if (typeof clientVersion === 'number' && clientVersion > 0) {
-      sendDeltaSync(socket, roomId, clientVersion);
-    } else {
-      sendFullSync(socket, roomId);
+    if (!SYNC_MODE_NAIVE) {
+      if (typeof clientVersion === 'number' && clientVersion > 0) {
+        sendDeltaSync(socket, roomId, clientVersion);
+      } else {
+        sendFullSync(socket, roomId);
+      }
     }
 
     // 广播给其他人
@@ -774,7 +1004,12 @@ io.on('connection', (socket) => {
     }
     markRoomNonEmpty(roomId);
     if (roomEmptySince[roomId]) delete roomEmptySince[roomId];
-    if (changed) saveStates();
+    if (changed) {
+      requestSaveStates('clear-room');
+      flushSaveStates({ reason: 'clear-room' }).catch(() => {
+        // ignore
+      });
+    }
 
     // 广播给房间内所有在线客户端：让它们执行本地 reset（清空画布/CRDT/History/临时 UI 状态）
     io.to(roomId).emit('room-cleared', {
@@ -792,6 +1027,7 @@ io.on('connection', (socket) => {
   // data: { roomId, id, data, timestamps }
   socket.on('draw-event', (payload) => {
     const { roomId, id, data, timestamps } = payload;
+    const bench = BENCH_PASS_THROUGH_ENABLED && payload && typeof payload.__bench === 'object' ? payload.__bench : null;
     
     if (roomId) markRoomNonEmpty(roomId);
     if (!roomStates[roomId]) {
@@ -803,6 +1039,18 @@ io.on('connection', (socket) => {
       return;
     }
 
+    if (SYNC_MODE_NAIVE) {
+      const serverVersion = bumpRoomVersion(roomId);
+      roomStates[roomId][id] = { id, data, timestamps };
+      io.to(roomId).emit(
+        'draw-event',
+        bench
+          ? { id, data, timestamps, serverEpoch: SERVER_EPOCH, serverVersion, __bench: bench }
+          : { id, data, timestamps, serverEpoch: SERVER_EPOCH, serverVersion }
+      );
+      return;
+    }
+
     // --- 服务器端简单的 LWW 合并逻辑 ---
     // 只有当本地没有该对象，或者远程时间戳更新时才覆盖
     const existing = roomStates[roomId][id];
@@ -810,15 +1058,22 @@ io.on('connection', (socket) => {
     if (!existing) {
       roomStates[roomId][id] = { id, data, timestamps };
       if (data && data._deleted) {
-        console.log(`[Server] Object ${id} marked as DELETED. Timestamp:`, timestamps._deleted);
+        if (DRAW_EVENT_DEBUG) {
+          console.log(`[Server] Object ${id} marked as DELETED. Timestamp:`, timestamps._deleted);
+        }
       }
       
       // [关键修复] 保存状态到文件
-      saveStates();
+      requestSaveStates('draw-event:new');
 
       const serverVersion = bumpRoomVersion(roomId);
       appendRoomDelta(roomId, { v: serverVersion, id, data, timestamps });
-      io.to(roomId).emit('draw-event', { id, data, timestamps, serverEpoch: SERVER_EPOCH, serverVersion });
+      io.to(roomId).emit(
+        'draw-event',
+        bench
+          ? { id, data, timestamps, serverEpoch: SERVER_EPOCH, serverVersion, __bench: bench }
+          : { id, data, timestamps, serverEpoch: SERVER_EPOCH, serverVersion }
+      );
       return;
     }
 
@@ -868,11 +1123,13 @@ io.on('connection', (socket) => {
     }
 
     if (acceptedData._deleted) {
-      console.log(`[Server] Object ${id} marked as DELETED. Timestamp:`, acceptedTimestamps._deleted);
+      if (DRAW_EVENT_DEBUG) {
+        console.log(`[Server] Object ${id} marked as DELETED. Timestamp:`, acceptedTimestamps._deleted);
+      }
     }
     
     // [关键修复] 保存状态到文件
-    saveStates();
+    requestSaveStates('draw-event:update');
 
     const serverVersion = bumpRoomVersion(roomId);
     appendRoomDelta(roomId, { v: serverVersion, id, data: acceptedData, timestamps: acceptedTimestamps });
@@ -881,7 +1138,8 @@ io.on('connection', (socket) => {
       data: acceptedData,
       timestamps: acceptedTimestamps,
       serverEpoch: SERVER_EPOCH,
-      serverVersion
+      serverVersion,
+      ...(bench ? { __bench: bench } : {})
     });
   });
 
