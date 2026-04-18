@@ -20,6 +20,23 @@ _pix2text_model = None
 _pix2tex_model = None
 
 
+@app.on_event("startup")
+def warmup_models() -> None:
+    flag = str(os.getenv("OCR_WARMUP", "1")).strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return
+    try:
+        model = _get_pix2text_model()
+        if model is not None:
+            return
+    except Exception:
+        pass
+    try:
+        _get_pix2tex_model()
+    except Exception:
+        pass
+
+
 def _get_pix2text_model() -> Any | None:
     global _pix2text_model
     if _pix2text_model is not None:

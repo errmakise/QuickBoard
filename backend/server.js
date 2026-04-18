@@ -672,17 +672,26 @@ function postJson(urlStr, payload, timeoutMs) {
       headers: { 'Content-Type': 'application/json' },
       signal: controller.signal,
       body: JSON.stringify(payload)
-    }).then(async (resp) => {
-      clearTimeout(timeout);
-      const text = await resp.text();
-      let data = null;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        data = null;
-      }
-      return { ok: resp.ok, status: resp.status, data, raw: text };
-    });
+    })
+      .then(async (resp) => {
+        clearTimeout(timeout);
+        const text = await resp.text();
+        let data = null;
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch {
+          data = null;
+        }
+        return { ok: resp.ok, status: resp.status, data, raw: text };
+      })
+      .catch((err) => {
+        clearTimeout(timeout);
+        const name = err && typeof err.name === 'string' ? err.name : '';
+        const message = err && typeof err.message === 'string' ? err.message : '';
+        const isTimeout = name === 'AbortError' || message.toUpperCase().includes('TIMEOUT');
+        const detail = isTimeout ? 'TIMEOUT' : (name || message || 'FETCH_FAILED');
+        return { ok: false, status: 0, data: { error: isTimeout ? 'TIMEOUT' : 'FETCH_FAILED', detail }, raw: '' };
+      });
   }
 
   return new Promise((resolve) => {
@@ -752,12 +761,23 @@ app.post('/api/recognize-math', async (req, res) => {
     'http://127.0.0.1:5007/recognize';
 
   try {
-    const upstream = await postJson(localUrl, { imageDataUrl }, 20000);
+    const upstream = await postJson(localUrl, { imageDataUrl }, 60000);
     if (!upstream.ok) {
+      const upstreamError =
+        upstream.data && typeof upstream.data.error === 'string' ? upstream.data.error : '';
       const detail =
         (upstream.data && typeof upstream.data.detail === 'string' ? upstream.data.detail : '') ||
         (upstream.data && typeof upstream.data.error === 'string' ? upstream.data.error : '') ||
         '';
+      if (upstreamError === 'TIMEOUT' || detail === 'TIMEOUT') {
+        res.status(200).json({
+          ok: false,
+          error: 'TIMEOUT',
+          status: upstream.status || 0,
+          detail: 'OCR_TIMEOUT'
+        });
+        return;
+      }
       res.status(200).json({
         ok: false,
         error: 'UPSTREAM_ERROR',
@@ -797,8 +817,14 @@ app.post('/api/recognize-math', async (req, res) => {
         ? { processedImageDataUrl: upstream.data.debug.processedImageDataUrl }
         : null;
     res.json(debug ? { ok: true, latex, debug } : { ok: true, latex });
-  } catch {
-    res.status(200).json({ ok: false, error: 'INTERNAL_ERROR' });
+  } catch (err) {
+    const name = err && typeof err.name === 'string' ? err.name : '';
+    const message = err && typeof err.message === 'string' ? err.message : '';
+    res.status(200).json({
+      ok: false,
+      error: 'INTERNAL_ERROR',
+      detail: `${name || 'Error'}${message ? `:${message}` : ''}`
+    });
   }
 });
 

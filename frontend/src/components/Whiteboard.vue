@@ -3,6 +3,7 @@ defineOptions({ name: 'WhiteboardBoard' })
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import * as fabric from 'fabric';
 import katex from 'katex';
+import QRCode from 'qrcode';
 import socketService from '../services/socket'; // 引入 Socket 服务
 import crdtManager from '../utils/crdt/CRDTManager'; // 引入 CRDT 管理器
 import historyManager, { AddCommand, RemoveCommand, ModifyCommand } from '../utils/History'; // 引入历史记录管理器
@@ -296,6 +297,25 @@ const openManualCopy = (text) => {
 };
 const closeManualCopy = () => {
   manualCopyOpen.value = false;
+};
+
+const shareQrOpen = ref(false);
+const shareQrLink = ref('');
+const shareQrDataUrl = ref('');
+const openShareQr = async () => {
+  const url = new URL(window.location.href);
+  url.searchParams.set('room', ROOM_ID);
+  const link = url.toString();
+  shareQrLink.value = link;
+  try {
+    shareQrDataUrl.value = await QRCode.toDataURL(link, { width: 240, margin: 1 });
+  } catch {
+    shareQrDataUrl.value = '';
+  }
+  shareQrOpen.value = true;
+};
+const closeShareQr = () => {
+  shareQrOpen.value = false;
 };
 
 const helpOpen = ref(false);
@@ -951,8 +971,67 @@ let isUndoRedo = false;
 let undoRedoInProgress = false;
 let undoRedoTimeout = null;
 let isMouseDown = false;
+let isErasing = false;
+let erasedObjectIdsInStroke = null;
+let eraserMoveRafId = 0;
+let lastEraserMoveEvent = null;
 let suppressNextLocalPathCreated = false;
 let suppressNextLocalPathCreatedTimeout = null;
+
+const eraseFabricObject = (obj) => {
+  if (!canvas) return;
+  if (!obj) return;
+  if (!obj.id) return;
+  if (obj.__isGhost === true) return;
+  if (obj.__draftShape === true) return;
+
+  if (erasedObjectIdsInStroke && erasedObjectIdsInStroke.has(obj.id)) return;
+  if (erasedObjectIdsInStroke) erasedObjectIdsInStroke.add(obj.id);
+
+  canvas.discardActiveObject();
+  canvas.remove(obj);
+  objectMap.delete(obj.id);
+  historyManager.push(new RemoveCommand(getAppContext(), obj));
+  const crdtState = crdtManager.delete(obj.id);
+  if (crdtState) {
+    socketService.emit('draw-event', { roomId: ROOM_ID, ...crdtState });
+  }
+  canvas.requestRenderAll();
+};
+
+const eraseTargetsInObject = (target) => {
+  if (!target) return;
+  if (target.type === 'activeSelection' && typeof target.getObjects === 'function') {
+    const arr = target.getObjects();
+    if (Array.isArray(arr)) {
+      for (const obj of arr) {
+        eraseFabricObject(obj);
+      }
+      return;
+    }
+  }
+  eraseFabricObject(target);
+};
+
+const eraseAtPointerEvent = (opt) => {
+  if (!canvas) return;
+  if (!opt || !opt.e) return;
+  const target = typeof canvas.findTarget === 'function' ? canvas.findTarget(opt.e) : (opt.target || null);
+  eraseTargetsInObject(target);
+};
+
+const scheduleEraseAtMove = (opt) => {
+  lastEraserMoveEvent = opt;
+  if (eraserMoveRafId) return;
+  eraserMoveRafId = requestAnimationFrame(() => {
+    eraserMoveRafId = 0;
+    const ev = lastEraserMoveEvent;
+    lastEraserMoveEvent = null;
+    if (!isErasing) return;
+    if (!ev) return;
+    eraseAtPointerEvent(ev);
+  });
+};
 
 // --- 视图交互：平移/缩放 (Pan & Zoom) ---
 // 目标：每个客户端都可以自由漫游自己的视图（不影响协同数据，只改变本地 viewportTransform）
@@ -1523,6 +1602,9 @@ onMounted(() => {
           canvas.upperCanvasEl.style.cursor = QB_CURSOR_ERASER;
         }
       }
+      if (isErasing) {
+        scheduleEraseAtMove(e);
+      }
     }
 
     // 节流发送 (Throttle)
@@ -1561,18 +1643,9 @@ onMounted(() => {
     }
 
     if (currentTool.value === 'eraser') {
-      const target = e && e.target;
-      if (target && target.id && target.__isGhost !== true) {
-        canvas.discardActiveObject();
-        canvas.remove(target);
-        objectMap.delete(target.id);
-        historyManager.push(new RemoveCommand(getAppContext(), target));
-        const crdtState = crdtManager.delete(target.id);
-        if (crdtState) {
-          socketService.emit('draw-event', { roomId: ROOM_ID, ...crdtState });
-        }
-        canvas.requestRenderAll();
-      }
+      isErasing = true;
+      erasedObjectIdsInStroke = new Set();
+      eraseAtPointerEvent(e);
       isMouseDown = false;
       return;
     }
@@ -1593,6 +1666,17 @@ onMounted(() => {
     }
   });
   canvas.on('mouse:up', (e) => {
+    if (currentTool.value === 'eraser') {
+      isErasing = false;
+      if (erasedObjectIdsInStroke) erasedObjectIdsInStroke.clear();
+      erasedObjectIdsInStroke = null;
+      if (eraserMoveRafId) {
+        cancelAnimationFrame(eraserMoveRafId);
+        eraserMoveRafId = 0;
+      }
+      lastEraserMoveEvent = null;
+      return;
+    }
     if (currentTool.value === 'rect' || currentTool.value === 'circle') {
       commitShapeDraft();
       return;
@@ -1811,6 +1895,10 @@ onUnmounted(() => {
     cancelAnimationFrame(viewportStatsRafId);
     viewportStatsRafId = null;
   }
+  if (eraserMoveRafId) {
+    cancelAnimationFrame(eraserMoveRafId);
+    eraserMoveRafId = 0;
+  }
   ghostBrushSender.dispose();
   cancelFormulaRecognize();
   void closeFormulaEditor(true);
@@ -1983,7 +2071,14 @@ const initSocket = () => {
 
   socketService.on('room-cleared', (data) => {
     if (!data || data.roomId !== ROOM_ID) return;
+    const by = typeof data.by === 'string' ? data.by : '';
+    const me = socketService.getSocketId();
     applyRoomClear();
+    if (by && me && by === me) {
+      pushToast('success', '房间已重置：云端存档已清除，撤销栈已清空', 4200);
+    } else {
+      pushToast('warning', '房间已被重置：所有人已清空并重置撤销栈', 4200);
+    }
   });
 
   socketService.on('lock-state', (payload) => {
@@ -2051,7 +2146,6 @@ const applyRoomClear = () => {
  * 清理“临时层（Ephemeral Layer）”状态：不影响正式对象、不会写入持久化。
  * 包含：
  * - Ghost Brush 预览线（按点流绘制的灰色 polyline）
- * - 远程光标 DOM
  * - Top context（Fabric 的上层临时绘制层）
  */
 const cleanupEphemeralState = () => {
@@ -2061,10 +2155,6 @@ const cleanupEphemeralState = () => {
     if (pathData.tempLine && canvas) canvas.remove(pathData.tempLine);
   }
   ghostPaths.clear();
-
-  for (const userId of Array.from(cursorMap.keys())) {
-    removeRemoteCursor(userId);
-  }
 
   if (canvas && canvas.contextTop && canvas.clearContext) {
     canvas.clearContext(canvas.contextTop);
@@ -2225,11 +2315,14 @@ const recognizeMathFromImage = async (imageDataUrl) => {
       const error = data && typeof data.error === 'string' ? data.error : 'HTTP_ERROR';
       const status =
         data && typeof data.status === 'number' ? data.status : typeof resp.status === 'number' ? resp.status : 0;
-      return { ok: false, error, status };
+      const detail = data && typeof data.detail === 'string' ? data.detail : '';
+      return { ok: false, error, status, detail };
     }
     return data || { ok: false, error: 'EMPTY_RESPONSE' };
-  } catch {
-    return { ok: false, error: 'NETWORK_ERROR' };
+  } catch (err) {
+    const name = err && typeof err.name === 'string' ? err.name : '';
+    const message = err && typeof err.message === 'string' ? err.message : '';
+    return { ok: false, error: 'NETWORK_ERROR', detail: `${name || 'Error'}${message ? `:${message}` : ''}` };
   }
 };
 
@@ -2288,6 +2381,8 @@ const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
     const detail = typeof result?.detail === 'string' ? result.detail.trim() : '';
     if (err === 'NOT_CONFIGURED') {
       pushToast('error', '识别服务未配置。', 4500);
+    } else if (err === 'TIMEOUT') {
+      pushToast('error', '识别超时：识别服务可能在冷启动或负载较高，请稍后重试或手动编辑。', 6500);
     } else if (err === 'NETWORK_ERROR') {
       pushToast('error', '识别失败：无法连接到后端（请确认后端已启动，且 VITE_API_URL 配置正确）。', 5200);
     } else if (err === 'UPSTREAM_ERROR') {
@@ -2300,6 +2395,31 @@ const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
       pushToast('error', '识别失败：识别服务未返回 latex。', 4500);
     } else {
       pushToast('error', `公式识别失败（${err}${status ? `, HTTP ${status}` : ''}），请重试或手动编辑。`, 5200);
+    }
+
+    if (canvas) {
+      const textbox = new fabric.Textbox('', {
+        left: cropLeft,
+        top: cropTop,
+        width: Math.max(220, Math.min(520, cropWidth)),
+        fontSize: 22,
+        fill: '#000000',
+        backgroundColor: 'rgba(255,255,255,0.8)',
+        borderColor: '#93c5fd',
+        cornerColor: '#3b82f6',
+        padding: 6,
+        editable: false
+      });
+      textbox.isFormula = true;
+      textbox.latex = '';
+      textbox.excludeFromExport = false;
+      canvas.add(textbox);
+      canvas.setActiveObject(textbox);
+      canvas.requestRenderAll();
+      setTimeout(() => {
+        if (!textbox.id) return;
+        openFormulaEditor(textbox);
+      }, 0);
     }
     return;
   }
@@ -2654,11 +2774,15 @@ const updateRemoteCursor = ({ userId, x, y, userName }) => {
     // 创建光标元素 (使用 HTML DOM 覆盖在 Canvas 上)
     const el = document.createElement('div');
     // 设置基础样式：绝对定位，不阻挡鼠标事件，过渡效果
-    el.className = 'qb-remote-cursor absolute pointer-events-none transition-transform duration-100 ease-linear z-50 flex flex-col items-center';
+    el.className = 'qb-remote-cursor absolute relative pointer-events-none transition-transform duration-100 ease-linear z-50 flex flex-col items-center';
 
     const c = getStableUserColor(userId);
+    el.style.setProperty('--qb-cursor-solid', c.solid);
+    el.style.setProperty('--qb-cursor-soft', c.soft);
+    el.style.setProperty('--qb-cursor-glow', c.glow);
 
     el.innerHTML = `
+      <div class="qb-cursor-halo"></div>
       <div class="qb-cursor-tail" style="width: 2px; height: 18px; border-radius: 999px; background: linear-gradient(to top, ${c.solid}, transparent); box-shadow: 0 0 16px ${c.glow};" />
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="filter: drop-shadow(0 4px 10px ${c.soft});">
         <path d="M5.65376 12.3673H5.46026L5.31717 12.4976L0.500002 16.8829L0.500002 1.19177L11.7841 12.3673H5.65376Z" fill="${c.solid}" stroke="white" stroke-width="1.5"/>
@@ -3272,33 +3396,34 @@ const setTool = (tool) => {
 // --- 方法：清空画布 ---
 const clearCanvas = async () => {
   if (!canvas) return;
+  const objects = canvas.getObjects();
+  const deletable = objects.filter((obj) => obj && obj.id && obj.__isGhost !== true && obj.__draftShape !== true);
+  const deletableCount = deletable.length;
   const ok = await confirmAsync(
-    '确认清空画布',
-    isOnline.value ? '确定要清空画布吗？该操作会同步给房间内所有人。' : '确定要清空画布吗？离线时不会同步给他人。',
-    '清空',
+    '确认清空内容',
+    isOnline.value
+      ? `确定要删除画布上的所有内容吗？将同步给房间内所有人。（对象数：${deletableCount}）`
+      : `确定要删除画布上的所有内容吗？离线时不会同步给他人。（对象数：${deletableCount}）`,
+    '删除全部',
     '取消'
   );
   if (!ok) return;
 
   // 遍历所有对象进行 CRDT 删除
-  const objects = canvas.getObjects();
-  objects.forEach(obj => {
-    if (obj.id) {
-      // 生成 Tombstone 并广播
-      const crdtState = crdtManager.delete(obj.id);
-      if (crdtState) {
-        socketService.emit('draw-event', {
-          roomId: ROOM_ID,
-          ...crdtState
-        });
-      }
+  deletable.forEach((obj) => {
+    const crdtState = crdtManager.delete(obj.id);
+    if (crdtState) {
+      socketService.emit('draw-event', {
+        roomId: ROOM_ID,
+        ...crdtState
+      });
     }
   });
 
   canvas.clear();
   canvas.backgroundColor = 'rgba(255,255,255,0)';
   objectMap.clear();
-  pushToast('success', isOnline.value ? '清空完成（已同步）' : '清空完成（未同步）');
+  pushToast('success', isOnline.value ? `已删除 ${deletableCount} 个对象（已同步）` : `已删除 ${deletableCount} 个对象（未同步）`);
 };
 
 const resetRoom = async () => {
@@ -3308,13 +3433,13 @@ const resetRoom = async () => {
   }
   const ok = await confirmAsync(
     '确认重置房间',
-    `确定要重置房间「${ROOM_ID}」吗？所有人都会被清空，且会删除服务端保存的状态。`,
-    '重置',
+    `确定要重置房间「${ROOM_ID}」吗？这会清除服务端保存的云端存档与版本号，并让所有人清空撤销栈（无法撤销）。`,
+    '重置房间',
     '取消'
   );
   if (!ok) return;
   socketService.emit('clear-room', { roomId: ROOM_ID });
-  pushToast('info', '已发出重置请求，等待同步…', 4200);
+  pushToast('info', '已发出重置请求：等待服务端广播“房间已重置”…', 4200);
 };
 
 /**
@@ -3656,6 +3781,10 @@ const exportJson = () => {
                 <button @click="copyRoomLink" :class="simpleBtnClass()" title="复制房间链接">
                   <span v-if="!toolbarCompact">分享</span>
                 </button>
+
+                <button @click="openShareQr" :class="simpleBtnClass()" title="显示房间二维码（扫码加入）">
+                  <span v-if="!toolbarCompact">二维码</span>
+                </button>
               </div>
 
               <div class="flex flex-wrap items-center gap-1">
@@ -3682,17 +3811,17 @@ const exportJson = () => {
                   <span v-if="!toolbarCompact">进入</span>
                 </button>
 
-                <button @click="clearCanvas" :class="dangerBtnClass()" title="清空画布">
-                  <span v-if="!toolbarCompact">清空</span>
+                <button @click="clearCanvas" :class="dangerBtnClass()" title="删除全部内容（会同步给房间内所有人）">
+                  <span v-if="!toolbarCompact">清空内容</span>
                 </button>
 
                 <button
                   @click="resetRoom"
                   :disabled="!isOnline"
                   :class="dangerBtnDisabledClass()"
-                  :title="isOnline ? '重置房间（清空服务端保存状态，所有人都会被清空）' : '离线中：无法重置房间'"
+                  :title="isOnline ? '重置房间（清除云端存档与撤销栈，所有人都会被清空）' : '离线中：无法重置房间'"
                 >
-                  <span v-if="!toolbarCompact">重置</span>
+                  <span v-if="!toolbarCompact">重置房间</span>
                 </button>
               </div>
 
@@ -3870,6 +3999,33 @@ const exportJson = () => {
       </div>
     </div>
 
+    <div v-if="shareQrOpen" class="absolute inset-0 z-40 bg-black/30 flex items-center justify-center pointer-events-auto">
+      <div class="w-[min(520px,92vw)] bg-white rounded-lg shadow-xl border border-gray-200 p-4">
+        <div class="text-sm font-medium text-gray-800">扫码加入房间</div>
+        <div class="mt-2 text-xs text-gray-500">把二维码展示给对方，对方用手机扫码即可打开并加入该房间。</div>
+        <div class="mt-3 flex items-center justify-center">
+          <div v-if="shareQrDataUrl" class="p-3 rounded-lg border border-gray-200 bg-white">
+            <img :src="shareQrDataUrl" alt="Room QR" class="w-[240px] h-[240px]" />
+          </div>
+          <div v-else class="text-xs text-gray-500">二维码生成失败，请改用“分享”复制链接。</div>
+        </div>
+        <input
+          :value="shareQrLink"
+          readonly
+          class="mt-3 w-full h-10 px-2 rounded border border-gray-200 text-sm font-mono"
+          @focus="$event.target && $event.target.select && $event.target.select()"
+        />
+        <div class="mt-4 flex justify-end gap-2">
+          <button
+            @click="closeShareQr"
+            class="px-3 py-1.5 rounded border border-gray-200 hover:bg-gray-50 text-sm"
+          >
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+
     <div v-if="isFormulaEditorOpen" class="absolute inset-0 bg-black/30 flex items-center justify-center pointer-events-auto">
       <div class="w-[min(720px,92vw)] bg-white rounded-lg shadow-xl border border-gray-200 p-4">
         <div class="text-sm font-medium text-gray-700 mb-2">编辑公式（LaTeX）</div>
@@ -3895,4 +4051,41 @@ const exportJson = () => {
   </div>
 </template>
 
-<style scoped></style>
+<style scoped>
+.qb-remote-cursor {
+  will-change: transform;
+}
+
+.qb-remote-cursor .qb-cursor-halo {
+  position: absolute;
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: radial-gradient(circle, var(--qb-cursor-soft), transparent 62%);
+  box-shadow: 0 0 0 0 var(--qb-cursor-soft);
+  animation: qbCursorBreathe 1.8s ease-in-out infinite;
+  opacity: 0.75;
+  z-index: -1;
+}
+
+@keyframes qbCursorBreathe {
+  0% {
+    transform: translateX(-50%) scale(0.9);
+    opacity: 0.55;
+    box-shadow: 0 0 0 0 var(--qb-cursor-soft);
+  }
+  50% {
+    transform: translateX(-50%) scale(1.15);
+    opacity: 0.95;
+    box-shadow: 0 0 18px 6px var(--qb-cursor-soft);
+  }
+  100% {
+    transform: translateX(-50%) scale(0.9);
+    opacity: 0.55;
+    box-shadow: 0 0 0 0 var(--qb-cursor-soft);
+  }
+}
+</style>

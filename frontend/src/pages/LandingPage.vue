@@ -10,13 +10,8 @@ const joinInput = ref('')
 const errorText = ref('')
 const recentRooms = ref([])
 const rootEl = ref(null)
-const createBtnEl = ref(null)
-const joinBtnEl = ref(null)
-const joinWrapEl = ref(null)
 
 const isJoinShaking = ref(false)
-const sparks = ref([])
-let sparkSeq = 0
 let mouseRaf = 0
 let detachMouseMove = null
 
@@ -35,44 +30,9 @@ const goBoard = async (roomId) => {
   await router.push({ name: 'board', query: { room: id } })
 }
 
-const spawnSparks = (targetEl, type) => {
-  const host = rootEl.value
-  const el = targetEl && targetEl.getBoundingClientRect ? targetEl : null
-  const hostRect = host && host.getBoundingClientRect ? host.getBoundingClientRect() : null
-  if (!hostRect || !el) return
-
-  const rect = el.getBoundingClientRect()
-  const cx = rect.left - hostRect.left + rect.width / 2
-  const cy = rect.top - hostRect.top + rect.height / 2
-  const count = type === 'error' ? 10 : 14
-
-  const palette =
-    type === 'error'
-      ? ['rgba(239, 68, 68, 0.95)', 'rgba(251, 113, 133, 0.95)', 'rgba(244, 63, 94, 0.95)']
-      : ['rgba(59, 130, 246, 0.95)', 'rgba(168, 85, 247, 0.95)', 'rgba(34, 197, 94, 0.9)']
-
-  const next = []
-  for (let i = 0; i < count; i += 1) {
-    const a = Math.random() * Math.PI * 2
-    const dist = 26 + Math.random() * 44
-    const dx = Math.cos(a) * dist
-    const dy = Math.sin(a) * dist
-    const size = 4 + Math.random() * 6
-    const color = palette[Math.floor(Math.random() * palette.length)]
-    next.push({ id: `s${Date.now()}_${sparkSeq++}`, x: cx, y: cy, dx, dy, size, color })
-  }
-
-  sparks.value = [...(sparks.value || []), ...next]
-  setTimeout(() => {
-    const ids = new Set(next.map((x) => x.id))
-    sparks.value = (sparks.value || []).filter((x) => x && !ids.has(x.id))
-  }, 720)
-}
-
 const createRoom = async () => {
   errorText.value = ''
   const roomId = generateRoomId()
-  spawnSparks(createBtnEl.value)
   await goBoard(roomId)
 }
 
@@ -85,10 +45,8 @@ const joinRoom = async () => {
     setTimeout(() => {
       isJoinShaking.value = false
     }, 460)
-    spawnSparks(joinWrapEl.value || joinBtnEl.value, 'error')
     return
   }
-  spawnSparks(joinBtnEl.value)
   await goBoard(id)
 }
 
@@ -178,15 +136,6 @@ onUnmounted(() => {
             <div class="text-xs text-gray-500">极简 · 轻量高效 · 趣味驱动</div>
           </div>
         </div>
-        <a
-          href="https://github.com/"
-          target="_blank"
-          rel="noreferrer"
-          class="qb-btn px-3 py-1.5 text-xs"
-          title="占位：可替换为你的仓库/演示文档链接"
-        >
-          Docs
-        </a>
       </div>
 
       <div class="mt-10 grid grid-cols-1 lg:grid-cols-[1.2fr_0.8fr] gap-6">
@@ -206,7 +155,6 @@ onUnmounted(() => {
           <div class="mt-4 flex flex-col gap-2">
             <button
               @click="createRoom"
-              ref="createBtnEl"
               class="qb-btn qb-btn-primary h-11"
             >
               <span class="text-base">✨</span>
@@ -214,7 +162,6 @@ onUnmounted(() => {
             </button>
 
             <div
-              ref="joinWrapEl"
               class="rounded-2xl border border-gray-200/80 bg-white/70 p-4 shadow-sm"
               :class="{ 'animate-qb-shake': isJoinShaking }"
             >
@@ -223,12 +170,11 @@ onUnmounted(() => {
                 <input
                   v-model="joinInput"
                   class="qb-input flex-1"
-                  placeholder="输入房间号，或粘贴邀请链接"
+                  placeholder="输入房间号（如 K7M2-9QF4），或粘贴邀请链接"
                   @keydown.enter="joinRoom"
                 />
                 <button
                   @click="joinRoom"
-                  ref="joinBtnEl"
                   class="qb-btn h-10 px-4"
                 >
                   进入
@@ -245,14 +191,6 @@ onUnmounted(() => {
         <div class="qb-card p-6">
           <div class="flex items-center justify-between">
             <div class="text-sm font-medium text-gray-900">最近房间</div>
-            <button
-              v-if="recentRooms.length"
-              @click="refreshRecent"
-              class="qb-btn px-3 py-1.5 text-xs"
-              title="刷新列表"
-            >
-              刷新
-            </button>
           </div>
           <div class="mt-1 text-sm text-gray-600">一键回到你刚才的协作现场。</div>
 
@@ -293,24 +231,6 @@ onUnmounted(() => {
       <div class="mt-8 text-xs text-gray-500">
         兼容旧链接：<span class="font-mono">/?room=xxx</span> 也会自动跳转到白板。
       </div>
-    </div>
-
-    <div class="pointer-events-none absolute inset-0">
-      <div
-        v-for="s in sparks"
-        :key="s.id"
-        class="qb-spark absolute rounded-full"
-        :style="{
-          left: `${s.x}px`,
-          top: `${s.y}px`,
-          width: `${s.size}px`,
-          height: `${s.size}px`,
-          background: s.color,
-          boxShadow: `0 0 18px ${s.color}`,
-          '--dx': `${s.dx}px`,
-          '--dy': `${s.dy}px`
-        }"
-      />
     </div>
   </div>
 </template>
