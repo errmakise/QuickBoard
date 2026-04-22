@@ -748,85 +748,15 @@ function postJson(urlStr, payload, timeoutMs) {
   });
 }
 
-app.post('/api/recognize-math', async (req, res) => {
-  const imageDataUrl = req?.body?.imageDataUrl;
-  if (typeof imageDataUrl !== 'string' || !imageDataUrl.startsWith('data:image/')) {
-    res.status(400).json({ ok: false, error: 'BAD_IMAGE' });
-    return;
-  }
-
-  const localUrl =
-    process.env.LOCAL_MATH_OCR_URL ||
-    process.env.MATH_OCR_URL ||
-    'http://127.0.0.1:5007/recognize';
-
-  try {
-    const upstream = await postJson(localUrl, { imageDataUrl }, 60000);
-    if (!upstream.ok) {
-      const upstreamError =
-        upstream.data && typeof upstream.data.error === 'string' ? upstream.data.error : '';
-      const detail =
-        (upstream.data && typeof upstream.data.detail === 'string' ? upstream.data.detail : '') ||
-        (upstream.data && typeof upstream.data.error === 'string' ? upstream.data.error : '') ||
-        '';
-      if (upstreamError === 'TIMEOUT' || detail === 'TIMEOUT') {
-        res.status(200).json({
-          ok: false,
-          error: 'TIMEOUT',
-          status: upstream.status || 0,
-          detail: 'OCR_TIMEOUT'
-        });
-        return;
-      }
-      res.status(200).json({
-        ok: false,
-        error: 'UPSTREAM_ERROR',
-        status: upstream.status || 0,
-        detail
-      });
-      return;
-    }
-
-    if (upstream.data && typeof upstream.data.error === 'string' && upstream.data.error) {
-      const detail = upstream.data && typeof upstream.data.detail === 'string' ? upstream.data.detail : '';
-      res.status(200).json({
-        ok: false,
-        error: 'UPSTREAM_ERROR',
-        status: upstream.status || 0,
-        detail: detail || upstream.data.error
-      });
-      return;
-    }
-
-    const latex =
-      (upstream.data && (typeof upstream.data.latex === 'string' ? upstream.data.latex : '')) ||
-      (upstream.data && (typeof upstream.data.result === 'string' ? upstream.data.result : '')) ||
-      '';
-    if (!latex) {
-      res.status(200).json({
-        ok: false,
-        error: 'EMPTY_LATEX',
-        status: upstream.status || 0
-      });
-      return;
-    }
-    const debug =
-      upstream.data &&
-      upstream.data.debug &&
-      typeof upstream.data.debug.processedImageDataUrl === 'string'
-        ? { processedImageDataUrl: upstream.data.debug.processedImageDataUrl }
-        : null;
-    res.json(debug ? { ok: true, latex, debug } : { ok: true, latex });
-  } catch (err) {
-    const name = err && typeof err.name === 'string' ? err.name : '';
-    const message = err && typeof err.message === 'string' ? err.message : '';
-    res.status(200).json({
-      ok: false,
-      error: 'INTERNAL_ERROR',
-      detail: `${name || 'Error'}${message ? `:${message}` : ''}`
-    });
-  }
-});
+const { createRecognizeMathHandler } = require('./recognizeMath');
+app.post(
+  '/api/recognize-math',
+  createRecognizeMathHandler({
+    postJson,
+    getUpstreamUrl: () =>
+      process.env.LOCAL_MATH_OCR_URL || process.env.MATH_OCR_URL || 'http://127.0.0.1:5007/recognize'
+  })
+);
 
 const server = http.createServer(app);
 
@@ -1182,8 +1112,13 @@ io.on('connection', (socket) => {
 
   // 监听：光标移动
   socket.on('cursor-move', (data) => {
-    const { roomId, x, y, userName } = data || {};
+    const { roomId, x, y, userName, seq } = data || {};
     if (!roomId) return;
+    const nx = Number(x);
+    const ny = Number(y);
+    if (!Number.isFinite(nx) || !Number.isFinite(ny)) return;
+    const ns = Number(seq);
+    const nseq = Number.isFinite(ns) ? Math.floor(ns) : null;
     const incomingName = typeof userName === 'string' ? userName.trim().slice(0, 24) : '';
     if (incomingName) socket.data.userName = incomingName;
     const finalName = incomingName || socket.data.userName || '';
@@ -1197,9 +1132,10 @@ io.on('connection', (socket) => {
     // 广播给房间内的其他人 (包含发送者的 ID)
     socket.to(roomId).emit('cursor-move', {
       userId: socket.id,
-      x,
-      y,
-      userName: finalName
+      x: nx,
+      y: ny,
+      userName: finalName,
+      ...(nseq != null ? { seq: nseq } : {})
     });
   });
 

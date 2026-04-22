@@ -123,11 +123,11 @@
   }
 
   .qb-remote-cursor {
-    animation: qb-pop 140ms ease-out;
+    animation: none;
   }
 
   .qb-cursor-tail {
-    animation: qb-tail 880ms ease-in-out infinite;
+    animation: none;
   }
 
   .qb-ring-container {

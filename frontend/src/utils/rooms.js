@@ -1,8 +1,7 @@
 const RECENT_ROOMS_KEY = 'qb:recentRooms'
 
 export const generateRoomId = () => {
-  const alphabet = 'ABCDEFGHJKMNPQRSTVWXYZ23456789'
-  const bytes = new Uint8Array(10)
+  const bytes = new Uint8Array(8)
   try {
     crypto.getRandomValues(bytes)
   } catch {
@@ -11,12 +10,13 @@ export const generateRoomId = () => {
     }
   }
 
-  let s = ''
-  for (let i = 0; i < 8; i += 1) {
-    const b = bytes[i] || 0
-    s += alphabet[b % alphabet.length]
+  let n = 0n
+  for (let i = 0; i < bytes.length; i += 1) {
+    n = (n << 8n) + BigInt(bytes[i] || 0)
   }
-  return `${s.slice(0, 4)}-${s.slice(4)}`
+  const mod = 10n ** 10n
+  const s = (n % mod).toString().padStart(10, '0')
+  return s
 }
 
 export const normalizeRoomIdInput = (raw) => {

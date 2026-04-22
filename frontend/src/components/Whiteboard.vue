@@ -8,6 +8,9 @@ import socketService from '../services/socket'; // 引入 Socket 服务
 import crdtManager from '../utils/crdt/CRDTManager'; // 引入 CRDT 管理器
 import historyManager, { AddCommand, RemoveCommand, ModifyCommand } from '../utils/History'; // 引入历史记录管理器
 import { createGhostBrushSender, downsamplePointsKeepTail, normalizeGhostBrushPayload } from '../utils/ghostBrush';
+import { applyDeadzone, expSmoothing, shouldAcceptMonotonicSeq } from '../utils/remoteCursor';
+import { recognizeMathFromImageDataUrl } from '../services/ocr';
+import { sceneRectToViewportRect } from '../utils/ocrCrop';
 
 // --- 状态变量 ---
 const isDev = import.meta.env?.DEV === true;
@@ -409,7 +412,136 @@ const onlineUsersLabel = computed(() => {
 });
 
 // --- 光标相关 ---
-const cursorMap = new Map(); // userId -> { element, x, y }
+const remoteCursorMap = new Map(); // userId -> cursor
+let remoteCursorRafId = 0;
+const REMOTE_CURSOR_TTL_MS = 20000;
+const REMOTE_CURSOR_SMOOTH_TAU_MS = 90;
+const REMOTE_CURSOR_DEADZONE_PX = 0.8;
+const REMOTE_CURSOR_LABEL_PAD_X = 10;
+const REMOTE_CURSOR_LABEL_PAD_Y = 3;
+const REMOTE_CURSOR_LABEL_OFFSET_X = 0;
+const REMOTE_CURSOR_LABEL_OFFSET_Y = 12;
+const REMOTE_CURSOR_LABEL_RADIUS = 6;
+const REMOTE_CURSOR_LABEL_TEXT = 'rgba(15,23,42,0.90)';
+const REMOTE_CURSOR_LABEL_BG_ALPHA = 0.32;
+const REMOTE_CURSOR_LABEL_BG_L = 82;
+const REMOTE_CURSOR_LABEL_BORDER_ALPHA = 0.28;
+const REMOTE_CURSOR_LABEL_BORDER_L = 58;
+
+const getRemoteCursorLabelBgFill = (hue) => `hsla(${hue}, 78%, ${REMOTE_CURSOR_LABEL_BG_L}%, ${REMOTE_CURSOR_LABEL_BG_ALPHA})`;
+const getRemoteCursorLabelBgStroke = (hue) => `hsla(${hue}, 78%, ${REMOTE_CURSOR_LABEL_BORDER_L}%, ${REMOTE_CURSOR_LABEL_BORDER_ALPHA})`;
+
+const updateRemoteCursorLabel = (cursor, userId, userName) => {
+  if (!cursor) return;
+  const label = cursor.labelObj;
+  const bg = cursor.labelBgObj;
+  if (!label || !bg) return;
+  const next = (typeof userName === 'string' && userName.trim() ? userName.trim().slice(0, 24) : userId.slice(0, 4)) || '';
+  if (label.text !== next) {
+    label.set({ text: next });
+  }
+  if (typeof label.initDimensions === 'function') {
+    try {
+      label.initDimensions();
+    } catch {
+      void 0;
+    }
+  }
+  const w = typeof label.width === 'number' && Number.isFinite(label.width) ? label.width : 0;
+  const h = typeof label.height === 'number' && Number.isFinite(label.height) ? label.height : 0;
+  const bw = Math.max(12, w + REMOTE_CURSOR_LABEL_PAD_X * 2);
+  const bh = Math.max(12, h + REMOTE_CURSOR_LABEL_PAD_Y * 2);
+  bg.set({ width: bw, height: bh, left: REMOTE_CURSOR_LABEL_OFFSET_X, top: REMOTE_CURSOR_LABEL_OFFSET_Y });
+  label.set({
+    left: REMOTE_CURSOR_LABEL_OFFSET_X,
+    top: REMOTE_CURSOR_LABEL_OFFSET_Y + (bh - h) / 2
+  });
+  bg.dirty = true;
+  label.dirty = true;
+  if (cursor.obj) cursor.obj.dirty = true;
+};
+
+const renderRemoteCursorsOnce = (force = false) => {
+  if (!canvas) return;
+  const now = performance.now();
+  let anyActive = false;
+  let anyDirty = false;
+  const zoom = typeof canvas.getZoom === 'function' ? canvas.getZoom() : 1;
+  const dzWorld = REMOTE_CURSOR_DEADZONE_PX / (zoom || 1);
+  const invScale = 1 / (zoom || 1);
+
+  for (const [userId, cursor] of remoteCursorMap.entries()) {
+    const lastSeenAt = typeof cursor.lastSeenAt === 'number' ? cursor.lastSeenAt : 0;
+    if (!lastSeenAt || now - lastSeenAt > REMOTE_CURSOR_TTL_MS) {
+      if (cursor && cursor.obj && canvas) {
+        canvas.remove(cursor.obj);
+      }
+      remoteCursorMap.delete(userId);
+      continue;
+    }
+
+    const tx = toFiniteNumber(cursor.tx);
+    const ty = toFiniteNumber(cursor.ty);
+    if (tx === null || ty === null) continue;
+
+    const prevCx = typeof cursor.cx === 'number' && Number.isFinite(cursor.cx) ? cursor.cx : null;
+    const prevCy = typeof cursor.cy === 'number' && Number.isFinite(cursor.cy) ? cursor.cy : null;
+    let cx = prevCx === null ? tx : prevCx;
+    let cy = prevCy === null ? ty : prevCy;
+
+    const dtMs = typeof cursor.lastRenderAt === 'number' && Number.isFinite(cursor.lastRenderAt) ? now - cursor.lastRenderAt : 16;
+    cursor.lastRenderAt = now;
+
+    if (force === true || cursor.snapNext === true) {
+      cx = tx;
+      cy = ty;
+      cursor.snapNext = false;
+    } else {
+      cx = applyDeadzone(cx, tx, dzWorld);
+      cy = applyDeadzone(cy, ty, dzWorld);
+      cx = expSmoothing(cx, tx, dtMs, REMOTE_CURSOR_SMOOTH_TAU_MS);
+      cy = expSmoothing(cy, ty, dtMs, REMOTE_CURSOR_SMOOTH_TAU_MS);
+    }
+
+    cursor.cx = cx;
+    cursor.cy = cy;
+
+    const obj = cursor.obj;
+    if (!obj) continue;
+    if (typeof invScale === 'number' && Number.isFinite(invScale)) {
+      const lastScale = typeof cursor.lastScale === 'number' && Number.isFinite(cursor.lastScale) ? cursor.lastScale : null;
+      if (lastScale === null || Math.abs(lastScale - invScale) > 1e-6) {
+        obj.set({ scaleX: invScale, scaleY: invScale });
+        cursor.lastScale = invScale;
+        anyDirty = true;
+      }
+    }
+    obj.set({ left: cx, top: cy });
+    if (typeof obj.setCoords === 'function') obj.setCoords();
+    obj.dirty = true;
+    anyDirty = true;
+    anyActive = true;
+  }
+
+  if (anyDirty) {
+    canvas.requestRenderAll();
+  }
+  if (!anyActive && remoteCursorRafId) {
+    cancelAnimationFrame(remoteCursorRafId);
+    remoteCursorRafId = 0;
+  }
+};
+
+const ensureRemoteCursorLoop = () => {
+  if (remoteCursorRafId) return;
+  remoteCursorRafId = requestAnimationFrame(function tick() {
+    remoteCursorRafId = 0;
+    renderRemoteCursorsOnce(false);
+    if (remoteCursorMap.size > 0) {
+      remoteCursorRafId = requestAnimationFrame(tick);
+    }
+  });
+};
 
 const hashStringToHue = (s) => {
   const str = String(s || '');
@@ -423,6 +555,7 @@ const hashStringToHue = (s) => {
 const getStableUserColor = (userId) => {
   const hue = hashStringToHue(userId);
   return {
+    hue,
     solid: `hsl(${hue} 86% 52%)`,
     soft: `hsla(${hue}, 86%, 52%, 0.22)`,
     glow: `hsla(${hue}, 86%, 52%, 0.45)`
@@ -903,9 +1036,20 @@ const clickToolRingItemByKey = (key) => {
 
 const lockState = ref({});
 const isFormulaEditorOpen = ref(false);
+const isFormulaInsertPreviewOpen = ref(false);
+let formulaInsertPending = null;
 const formulaEditorValue = ref('');
+const normalizeLatexForKatex = (src) => {
+  const s0 = String(src || '').trim();
+  if (!s0) return '';
+  if (s0.startsWith('\\(') && s0.endsWith('\\)')) return s0.slice(2, -2).trim();
+  if (s0.startsWith('\\[') && s0.endsWith('\\]')) return s0.slice(2, -2).trim();
+  if (s0.startsWith('$$') && s0.endsWith('$$') && s0.length >= 4) return s0.slice(2, -2).trim();
+  if (s0.startsWith('$') && s0.endsWith('$') && s0.length >= 2) return s0.slice(1, -1).trim();
+  return s0;
+};
 const formulaPreviewHtml = computed(() => {
-  const src = (formulaEditorValue.value || '').trim();
+  const src = normalizeLatexForKatex(formulaEditorValue.value || '');
   if (!src) return '';
   try {
     return katex.renderToString(src, {
@@ -917,6 +1061,8 @@ const formulaPreviewHtml = computed(() => {
     return '';
   }
 });
+const formulaEditorTitle = computed(() => (isFormulaInsertPreviewOpen.value ? '确认公式（LaTeX）' : '编辑公式（LaTeX）'));
+const formulaEditorOkText = computed(() => (isFormulaInsertPreviewOpen.value ? '添加到画布' : '保存'));
 let formulaEditingObjectId = null;
 let formulaEditingBeforeJson = null;
 let formulaEditingLockResourceId = null;
@@ -936,6 +1082,168 @@ const isFormulaRecognizing = ref(false);
 let formulaRecognizePrevTool = null;
 let formulaRecognizeStartPoint = null;
 let formulaRecognizeRect = null;
+let formulaRecognizeAbortController = null;
+let formulaOverlayRootEl = null;
+let formulaMeasureEl = null;
+const formulaOverlayMap = new Map();
+
+const ensureFormulaOverlayLayer = () => {
+  if (!canvas) return null;
+  if (formulaOverlayRootEl) return formulaOverlayRootEl;
+  const host = canvas.wrapperEl || (canvas.upperCanvasEl ? canvas.upperCanvasEl.parentElement : null);
+  if (!host) return null;
+  const root = document.createElement('div');
+  root.style.position = 'absolute';
+  root.style.left = '0';
+  root.style.top = '0';
+  root.style.width = '100%';
+  root.style.height = '100%';
+  root.style.pointerEvents = 'none';
+  root.style.zIndex = '0';
+  if (canvas.upperCanvasEl && typeof host.insertBefore === 'function') {
+    host.insertBefore(root, canvas.upperCanvasEl);
+  } else {
+    host.appendChild(root);
+  }
+  formulaOverlayRootEl = root;
+
+  const measure = document.createElement('div');
+  measure.style.position = 'absolute';
+  measure.style.left = '-10000px';
+  measure.style.top = '-10000px';
+  measure.style.visibility = 'hidden';
+  measure.style.pointerEvents = 'none';
+  root.appendChild(measure);
+  formulaMeasureEl = measure;
+  return formulaOverlayRootEl;
+};
+
+const measureFormulaSize = (latex, fontSize) => {
+  const root = ensureFormulaOverlayLayer();
+  if (!root || !formulaMeasureEl) return null;
+  const src = normalizeLatexForKatex(latex);
+  if (!src) return null;
+  try {
+    const html = katex.renderToString(src, { throwOnError: false, displayMode: false, strict: 'ignore' });
+    formulaMeasureEl.style.fontSize = `${Math.max(8, Number(fontSize) || 22)}px`;
+    formulaMeasureEl.innerHTML = html;
+    const r = formulaMeasureEl.getBoundingClientRect();
+    formulaMeasureEl.innerHTML = '';
+    const w = Math.max(1, Math.ceil(r.width));
+    const h = Math.max(1, Math.ceil(r.height));
+    return { w, h };
+  } catch {
+    formulaMeasureEl.innerHTML = '';
+    return null;
+  }
+};
+
+const applyFormulaCanvasStyle = (obj) => {
+  if (!obj) return;
+  obj.editable = false;
+  if ('fill' in obj) obj.fill = 'rgba(0,0,0,0)';
+  if ('backgroundColor' in obj) obj.backgroundColor = 'rgba(0,0,0,0)';
+  obj.padding = 0;
+  obj.originX = 'left';
+  obj.originY = 'top';
+};
+
+const setFormulaOverlayVisible = (visible) => {
+  if (!formulaOverlayRootEl) return;
+  formulaOverlayRootEl.style.opacity = visible ? '1' : '0';
+  formulaOverlayRootEl.style.visibility = visible ? 'visible' : 'hidden';
+  if (visible && canvas && typeof canvas.requestRenderAll === 'function') {
+    canvas.requestRenderAll();
+  }
+};
+
+const updateFormulaOverlayForObject = (obj) => {
+  if (!canvas) return;
+  if (!obj || !obj.id) return;
+  if (!isFormulaObject(obj)) return;
+  const root = ensureFormulaOverlayLayer();
+  if (!root) return;
+  applyFormulaCanvasStyle(obj);
+
+  const id = obj.id;
+  const raw = typeof obj.latex === 'string' ? obj.latex : typeof obj.text === 'string' ? obj.text : '';
+  const src = normalizeLatexForKatex(raw);
+  const fontSize = Number(obj.formulaFontSize ?? obj.fontSize) || 22;
+  const pad = Number(obj.formulaPad ?? obj.__formulaPad) || 0;
+
+  let entry = formulaOverlayMap.get(id);
+  if (!entry) {
+    const el = document.createElement('div');
+    el.style.position = 'absolute';
+    el.style.left = '0';
+    el.style.top = '0';
+    el.style.transformOrigin = '0 0';
+    el.style.pointerEvents = 'none';
+    el.style.whiteSpace = 'nowrap';
+    root.appendChild(el);
+    entry = { el, latex: '', fontSize: 0 };
+    formulaOverlayMap.set(id, entry);
+  }
+
+  if (!src) {
+    entry.el.style.display = 'none';
+    return;
+  }
+
+  entry.el.style.display = 'inline-block';
+  entry.el.style.fontSize = `${Math.max(8, fontSize)}px`;
+  if (entry.latex !== src || entry.fontSize !== fontSize) {
+    try {
+      entry.el.innerHTML = katex.renderToString(src, { throwOnError: false, displayMode: false, strict: 'ignore' });
+    } catch {
+      entry.el.innerHTML = '';
+    }
+    entry.latex = src;
+    entry.fontSize = fontSize;
+    const size = measureFormulaSize(src, fontSize);
+    if (size) {
+      try {
+        if (typeof obj.set === 'function') obj.set({ width: size.w + pad * 2, height: size.h + pad * 2 });
+        obj.setCoords();
+      } catch {
+        void 0;
+      }
+    }
+  }
+
+  const vpt = Array.isArray(canvas.viewportTransform) ? canvas.viewportTransform : [1, 0, 0, 1, 0, 0];
+  const p = fabric.util.transformPoint(new fabric.Point(Number(obj.left) || 0, Number(obj.top) || 0), vpt);
+  const z = typeof canvas.getZoom === 'function' ? canvas.getZoom() : 1;
+  const sx = (Number(obj.scaleX) || 1) * (Number(z) || 1);
+  const sy = (Number(obj.scaleY) || 1) * (Number(z) || 1);
+  const angle = Number(obj.angle) || 0;
+  entry.el.style.left = `${p.x}px`;
+  entry.el.style.top = `${p.y}px`;
+  entry.el.style.transform = `rotate(${angle}deg) scale(${sx}, ${sy}) translate(${pad}px, ${pad}px)`;
+};
+
+const syncFormulaOverlays = () => {
+  if (!canvas) return;
+  const root = ensureFormulaOverlayLayer();
+  if (!root) return;
+  const objs = typeof canvas.getObjects === 'function' ? canvas.getObjects() : [];
+  const alive = new Set();
+  for (const obj of objs) {
+    if (!obj || !obj.id) continue;
+    if (!isFormulaObject(obj)) continue;
+    alive.add(obj.id);
+    updateFormulaOverlayForObject(obj);
+  }
+  for (const [id, entry] of formulaOverlayMap.entries()) {
+    if (alive.has(id)) continue;
+    try {
+      if (entry && entry.el && entry.el.parentNode) entry.el.parentNode.removeChild(entry.el);
+    } catch {
+      void 0;
+    }
+    formulaOverlayMap.delete(id);
+  }
+};
 const formulaRecognizeHint = computed(() => {
   if (isFormulaRecognizing.value) return '识别中…';
   if (isFormulaRecognizeMode.value) return '识别：拖拽框选区域（Esc 取消）';
@@ -978,12 +1286,79 @@ let lastEraserMoveEvent = null;
 let suppressNextLocalPathCreated = false;
 let suppressNextLocalPathCreatedTimeout = null;
 
+const toFiniteNumber = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+const getWorldPointFromClient = (clientX, clientY) => {
+  if (!canvas || !canvas.upperCanvasEl) return null;
+  const sx = toFiniteNumber(clientX);
+  const sy = toFiniteNumber(clientY);
+  if (sx === null || sy === null) return null;
+  const rect = canvas.upperCanvasEl.getBoundingClientRect();
+  const px = sx - rect.left;
+  const py = sy - rect.top;
+  const vpt = canvas.viewportTransform || [1, 0, 0, 1, 0, 0];
+  const inv = fabric.util.invertTransform(vpt);
+  const world = fabric.util.transformPoint(new fabric.Point(px, py), inv);
+  const x = toFiniteNumber(world && world.x);
+  const y = toFiniteNumber(world && world.y);
+  if (x === null || y === null) return null;
+  return { x, y };
+};
+
+const getScenePointFromEvent = (evt) => {
+  if (!canvas) return null;
+  if (evt && evt.scenePoint) {
+    const x = toFiniteNumber(evt.scenePoint.x);
+    const y = toFiniteNumber(evt.scenePoint.y);
+    if (x !== null && y !== null) return { x, y };
+  }
+  if (evt && evt.e && typeof canvas.getScenePoint === 'function') {
+    try {
+      const p = canvas.getScenePoint(evt.e);
+      const x = toFiniteNumber(p && p.x);
+      const y = toFiniteNumber(p && p.y);
+      if (x !== null && y !== null) return { x, y };
+    } catch {}
+  }
+  if (evt && evt.e && typeof canvas.getPointer === 'function') {
+    try {
+      const p = canvas.getPointer(evt.e, true);
+      const x = toFiniteNumber(p && p.x);
+      const y = toFiniteNumber(p && p.y);
+      if (x !== null && y !== null) return { x, y };
+    } catch {}
+  }
+  if (evt && evt.e && canvas && canvas.upperCanvasEl) {
+    try {
+      const rect = canvas.upperCanvasEl.getBoundingClientRect();
+      const sx = toFiniteNumber(evt.e.clientX);
+      const sy = toFiniteNumber(evt.e.clientY);
+      if (sx !== null && sy !== null) {
+        const px = sx - rect.left;
+        const py = sy - rect.top;
+        const vpt = canvas.viewportTransform || [1, 0, 0, 1, 0, 0];
+        const inv = fabric.util.invertTransform(vpt);
+        const world = fabric.util.transformPoint(new fabric.Point(px, py), inv);
+        const x = toFiniteNumber(world && world.x);
+        const y = toFiniteNumber(world && world.y);
+        if (x !== null && y !== null) return { x, y };
+      }
+    } catch {}
+  }
+  return null;
+};
+
 const eraseFabricObject = (obj) => {
   if (!canvas) return;
   if (!obj) return;
-  if (!obj.id) return;
   if (obj.__isGhost === true) return;
   if (obj.__draftShape === true) return;
+  if (!obj.id) {
+    obj.id = generateId();
+  }
 
   if (erasedObjectIdsInStroke && erasedObjectIdsInStroke.has(obj.id)) return;
   if (erasedObjectIdsInStroke) erasedObjectIdsInStroke.add(obj.id);
@@ -991,7 +1366,9 @@ const eraseFabricObject = (obj) => {
   canvas.discardActiveObject();
   canvas.remove(obj);
   objectMap.delete(obj.id);
-  historyManager.push(new RemoveCommand(getAppContext(), obj));
+  if (typeof obj.toJSON === 'function') {
+    historyManager.push(new RemoveCommand(getAppContext(), obj));
+  }
   const crdtState = crdtManager.delete(obj.id);
   if (crdtState) {
     socketService.emit('draw-event', { roomId: ROOM_ID, ...crdtState });
@@ -1015,9 +1392,35 @@ const eraseTargetsInObject = (target) => {
 
 const eraseAtPointerEvent = (opt) => {
   if (!canvas) return;
-  if (!opt || !opt.e) return;
-  const target = typeof canvas.findTarget === 'function' ? canvas.findTarget(opt.e) : (opt.target || null);
-  eraseTargetsInObject(target);
+  const pointer = getScenePointFromEvent(opt);
+  if (!pointer) return;
+
+  const objects = canvas.getObjects ? canvas.getObjects() : [];
+  let hitTarget = null;
+
+  for (let i = objects.length - 1; i >= 0; i--) {
+    const obj = objects[i];
+    if (!obj || obj.__isGhost === true || obj.__draftShape === true) continue;
+    if (typeof obj.containsPoint === 'function' && obj.containsPoint(pointer)) {
+      hitTarget = obj;
+      break;
+    }
+    if (typeof obj.isPointInObject === 'function' && obj.isPointInObject(pointer.x, pointer.y)) {
+      hitTarget = obj;
+      break;
+    }
+    const br = typeof obj.getBoundingRect === 'function' ? obj.getBoundingRect(true, true) : null;
+    if (br && pointer.x >= br.left && pointer.x <= br.left + br.width && pointer.y >= br.top && pointer.y <= br.top + br.height) {
+      if (obj.type !== 'activeSelection') {
+        hitTarget = obj;
+        break;
+      }
+    }
+  }
+
+  if (hitTarget) {
+    eraseTargetsInObject(hitTarget);
+  }
 };
 
 const scheduleEraseAtMove = (opt) => {
@@ -1379,6 +1782,8 @@ const patchFabricSerialization = () => {
     if (this.__isGhost === true) base.__isGhost = true;
     if (this.isFormula === true) base.isFormula = true;
     if (typeof this.latex === 'string') base.latex = this.latex;
+    if (typeof this.formulaFontSize === 'number') base.formulaFontSize = this.formulaFontSize;
+    if (typeof this.formulaPad === 'number') base.formulaPad = this.formulaPad;
     return base;
   };
   fabricSerializationPatched = true;
@@ -1416,6 +1821,8 @@ onMounted(() => {
   if (isDev) {
     window.__canvas = canvas;
   }
+  ensureFormulaOverlayLayer();
+  canvas.on('after:render', syncFormulaOverlays);
 
   // 2. 配置画笔样式
   const brush = new fabric.PencilBrush(canvas);
@@ -1607,23 +2014,12 @@ onMounted(() => {
       }
     }
 
-    // 节流发送 (Throttle)
-    // 鼠标移动事件触发频率极高 (每秒60+次)，如果每次都发送 WebSocket 消息，会造成“网络风暴”
-    // 所以我们限制发送频率，每 50ms (即每秒 20 次) 最多发送一次
-    const now = Date.now();
-    const pointer = e.scenePoint;
+    const pointer =
+      getScenePointFromEvent(e) || (e && e.e ? getWorldPointFromClient(e.e.clientX, e.e.clientY) : null);
     if (!pointer) return;
 
-    // 1. 发送光标位置 (50ms 节流)
-    if (now - lastCursorSend > 50) {
-      socketService.emit('cursor-move', {
-        roomId: ROOM_ID,
-        x: pointer.x,
-        y: pointer.y,
-        userName: myName.value
-      });
-      lastCursorSend = now;
-    }
+    pendingCursorPoint = pointer;
+    scheduleCursorSend();
 
     // 2. 发送实时绘图路径 (如果正在绘图)
     // 调试：打印状态
@@ -1651,7 +2047,7 @@ onMounted(() => {
     }
 
     if (currentTool.value === 'rect' || currentTool.value === 'circle') {
-      const p = e && e.scenePoint;
+      const p = getScenePointFromEvent(e);
       if (p) {
         beginShapeDraft(currentTool.value, p);
       }
@@ -1687,7 +2083,7 @@ onMounted(() => {
 
   canvas.on('mouse:move', (e) => {
     if (currentTool.value === 'rect' || currentTool.value === 'circle') {
-      const p = e && e.scenePoint;
+      const p = getScenePointFromEvent(e);
       if (p) updateShapeDraft(p);
     }
   });
@@ -1899,9 +2295,27 @@ onUnmounted(() => {
     cancelAnimationFrame(eraserMoveRafId);
     eraserMoveRafId = 0;
   }
+  if (remoteCursorRafId) {
+    cancelAnimationFrame(remoteCursorRafId);
+    remoteCursorRafId = 0;
+  }
+  if (cursorSendRafId) {
+    cancelAnimationFrame(cursorSendRafId);
+    cursorSendRafId = 0;
+  }
   ghostBrushSender.dispose();
   cancelFormulaRecognize();
   void closeFormulaEditor(true);
+  try {
+    if (formulaOverlayRootEl && formulaOverlayRootEl.parentNode) {
+      formulaOverlayRootEl.parentNode.removeChild(formulaOverlayRootEl);
+    }
+  } catch {
+    void 0;
+  }
+  formulaOverlayRootEl = null;
+  formulaMeasureEl = null;
+  formulaOverlayMap.clear();
   if (canvas) canvas.dispose();
   socketService.disconnect();
 });
@@ -2039,6 +2453,11 @@ const initSocket = () => {
   socketService.on('user-name', (data) => {
     if (!data || !data.userId) return;
     upsertOnlineUser(data.userId, data.userName || '');
+    const cursor = remoteCursorMap.get(data.userId);
+    if (cursor) {
+      updateRemoteCursorLabel(cursor, data.userId, data.userName || '');
+      if (canvas) canvas.requestRenderAll();
+    }
   });
 
   // 监听：用户加入
@@ -2124,7 +2543,7 @@ const applyRoomClear = () => {
   }
   ghostPaths.clear();
 
-  for (const userId of Array.from(cursorMap.keys())) {
+  for (const userId of Array.from(remoteCursorMap.keys())) {
     removeRemoteCursor(userId);
   }
 
@@ -2155,6 +2574,10 @@ const cleanupEphemeralState = () => {
     if (pathData.tempLine && canvas) canvas.remove(pathData.tempLine);
   }
   ghostPaths.clear();
+
+  for (const userId of Array.from(remoteCursorMap.keys())) {
+    removeRemoteCursor(userId);
+  }
 
   if (canvas && canvas.contextTop && canvas.clearContext) {
     canvas.clearContext(canvas.contextTop);
@@ -2276,6 +2699,14 @@ const cancelFormulaRecognize = () => {
   isFormulaRecognizeMode.value = false;
   isFormulaRecognizing.value = false;
   formulaRecognizeStartPoint = null;
+  if (formulaRecognizeAbortController) {
+    try {
+      formulaRecognizeAbortController.abort();
+    } catch {
+      void 0;
+    }
+    formulaRecognizeAbortController = null;
+  }
   cleanupFormulaRecognizeRect();
   applyFormulaRecognizeMode(false);
 };
@@ -2298,32 +2729,13 @@ const startFormulaRecognize = () => {
   applyFormulaRecognizeMode(true);
 };
 
-const recognizeMathFromImage = async (imageDataUrl) => {
-  const envUrl = String(import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
-  const protocol = String(window.location?.protocol || 'http:');
-  const host = String(window.location?.hostname || 'localhost');
-  const apiUrl = envUrl || `${protocol}//${host}:3000`;
-
-  try {
-    const resp = await fetch(`${apiUrl}/api/recognize-math`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ imageDataUrl })
-    });
-    const data = await resp.json().catch(() => null);
-    if (!resp.ok) {
-      const error = data && typeof data.error === 'string' ? data.error : 'HTTP_ERROR';
-      const status =
-        data && typeof data.status === 'number' ? data.status : typeof resp.status === 'number' ? resp.status : 0;
-      const detail = data && typeof data.detail === 'string' ? data.detail : '';
-      return { ok: false, error, status, detail };
-    }
-    return data || { ok: false, error: 'EMPTY_RESPONSE' };
-  } catch (err) {
-    const name = err && typeof err.name === 'string' ? err.name : '';
-    const message = err && typeof err.message === 'string' ? err.message : '';
-    return { ok: false, error: 'NETWORK_ERROR', detail: `${name || 'Error'}${message ? `:${message}` : ''}` };
+const recognizeMathFromImage = async (imageDataUrl, { signal, debug = false } = {}) => {
+  const primary = await recognizeMathFromImageDataUrl({ imageDataUrl, timeoutMs: 25000, debug: Boolean(debug), signal });
+  if (primary && primary.ok !== true && primary.error === 'EMPTY_LATEX' && debug !== true) {
+    const retry = await recognizeMathFromImageDataUrl({ imageDataUrl, timeoutMs: 25000, debug: true, signal });
+    return retry || primary;
   }
+  return primary;
 };
 
 const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
@@ -2335,29 +2747,92 @@ const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
 
   const canvasW = canvas.getWidth();
   const canvasH = canvas.getHeight();
-  const pad = Math.max(8, Math.min(24, Math.min(width, height) * 0.06));
-  const cropLeft = Math.max(0, left - pad);
-  const cropTop = Math.max(0, top - pad);
-  const cropRight = Math.min(canvasW, left + width + pad);
-  const cropBottom = Math.min(canvasH, top + height + pad);
-  const cropWidth = Math.max(1, cropRight - cropLeft);
-  const cropHeight = Math.max(1, cropBottom - cropTop);
-  const longest = Math.max(cropWidth, cropHeight);
+  const vpt = Array.isArray(canvas.viewportTransform) ? canvas.viewportTransform : [1, 0, 0, 1, 0, 0];
+  const zoom = typeof canvas.getZoom === 'function' ? canvas.getZoom() : 1;
+  const vr = sceneRectToViewportRect(vpt, { left, top, width, height });
+  const padPx = Math.max(8, Math.min(24, Math.min(vr.width, vr.height) * 0.06));
+  const cropLeftV = Math.max(0, vr.left - padPx);
+  const cropTopV = Math.max(0, vr.top - padPx);
+  const cropRightV = Math.min(canvasW, vr.left + vr.width + padPx);
+  const cropBottomV = Math.min(canvasH, vr.top + vr.height + padPx);
+  const cropWidthV = Math.max(1, cropRightV - cropLeftV);
+  const cropHeightV = Math.max(1, cropBottomV - cropTopV);
+  const longest = Math.max(cropWidthV, cropHeightV);
   let multiplier = longest > 600 ? 2 : longest > 350 ? 3 : 4;
-  while (multiplier > 2 && (cropWidth * multiplier > 1600 || cropHeight * multiplier > 1600)) {
+  while (multiplier > 2 && (cropWidthV * multiplier > 1600 || cropHeightV * multiplier > 1600)) {
     multiplier -= 1;
   }
 
-  const imageDataUrl = canvas.toDataURL({
-    format: 'png',
-    left: cropLeft,
-    top: cropTop,
-    width: cropWidth,
-    height: cropHeight,
-    multiplier
-  });
+  try {
+    if (typeof canvas.renderAll === 'function') canvas.renderAll();
+  } catch {
+    void 0;
+  }
 
-  const result = await recognizeMathFromImage(imageDataUrl);
+  const lowerCanvasEl = canvas && canvas.lowerCanvasEl ? canvas.lowerCanvasEl : null;
+  const rs =
+    typeof canvas?.getRetinaScaling === 'function'
+      ? canvas.getRetinaScaling()
+      : typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number'
+        ? window.devicePixelRatio
+        : 1;
+  const safeRs = typeof rs === 'number' && Number.isFinite(rs) && rs > 0 ? rs : 1;
+
+  let imageDataUrl = '';
+  if (lowerCanvasEl && typeof lowerCanvasEl.getContext === 'function') {
+    const sx = Math.round(cropLeftV * safeRs);
+    const sy = Math.round(cropTopV * safeRs);
+    const sw = Math.max(1, Math.round(cropWidthV * safeRs));
+    const sh = Math.max(1, Math.round(cropHeightV * safeRs));
+    const out = document.createElement('canvas');
+    out.width = sw;
+    out.height = sh;
+    const ctx = out.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, sw, sh);
+      ctx.drawImage(lowerCanvasEl, sx, sy, sw, sh, 0, 0, sw, sh);
+      if (multiplier > 1) {
+        const scaled = document.createElement('canvas');
+        scaled.width = Math.max(1, Math.round(sw * multiplier));
+        scaled.height = Math.max(1, Math.round(sh * multiplier));
+        const sctx = scaled.getContext('2d');
+        if (sctx) {
+          sctx.fillStyle = '#ffffff';
+          sctx.fillRect(0, 0, scaled.width, scaled.height);
+          sctx.drawImage(out, 0, 0, sw, sh, 0, 0, scaled.width, scaled.height);
+          imageDataUrl = scaled.toDataURL('image/png');
+        } else {
+          imageDataUrl = out.toDataURL('image/png');
+        }
+      } else {
+        imageDataUrl = out.toDataURL('image/png');
+      }
+    }
+  }
+
+  if (!imageDataUrl) {
+    imageDataUrl = canvas.toDataURL({
+      format: 'png',
+      left: cropLeftV,
+      top: cropTopV,
+      width: cropWidthV,
+      height: cropHeightV,
+      multiplier
+    });
+  }
+
+  window.__ocrDebugLastInput = { imageDataUrl, cropLeftV, cropTopV, cropWidthV, cropHeightV, multiplier, rs: safeRs };
+
+  if (formulaRecognizeAbortController) {
+    try {
+      formulaRecognizeAbortController.abort();
+    } catch {
+      void 0;
+    }
+  }
+  formulaRecognizeAbortController = new AbortController();
+  const result = await recognizeMathFromImage(imageDataUrl, { signal: formulaRecognizeAbortController.signal });
   const latex = typeof result?.latex === 'string' ? result.latex : '';
   const debugProcessed =
     result && result.debug && typeof result.debug.processedImageDataUrl === 'string'
@@ -2374,52 +2849,35 @@ const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
   isFormulaRecognizeMode.value = false;
   applyFormulaRecognizeMode(false);
   isFormulaRecognizing.value = false;
+  formulaRecognizeAbortController = null;
 
   if (!result || result.ok !== true) {
     const err = result?.error || 'UNKNOWN_ERROR';
     const status = typeof result?.status === 'number' ? result.status : null;
     const detail = typeof result?.detail === 'string' ? result.detail.trim() : '';
+    const traceId = typeof result?.traceId === 'string' ? result.traceId.trim() : '';
     if (err === 'NOT_CONFIGURED') {
       pushToast('error', '识别服务未配置。', 4500);
+    } else if (err === 'ABORTED') {
+      pushToast('info', '已取消识别。', 2600);
     } else if (err === 'TIMEOUT') {
       pushToast('error', '识别超时：识别服务可能在冷启动或负载较高，请稍后重试或手动编辑。', 6500);
     } else if (err === 'NETWORK_ERROR') {
       pushToast('error', '识别失败：无法连接到后端（请确认后端已启动，且 VITE_API_URL 配置正确）。', 5200);
+    } else if (err === 'MODEL_NOT_INSTALLED') {
+      pushToast('error', '识别失败：OCR 模型未安装/不可用（请确认 OCR 服务依赖已安装并启动）。', 6500);
+    } else if (err === 'RECOGNIZE_FAILED') {
+      pushToast('error', `识别失败：OCR 推理异常${detail ? `：${detail}` : ''}。`, 6500);
     } else if (err === 'UPSTREAM_ERROR') {
       pushToast(
         'error',
-        `识别失败：本地识别服务不可用或返回错误${status ? `（HTTP ${status}）` : ''}${detail ? `：${detail}` : ''}。`,
+        `识别失败：本地识别服务不可用或返回错误${status ? `（HTTP ${status}）` : ''}${detail ? `：${detail}` : ''}${traceId ? `（traceId:${traceId}）` : ''}。`,
         6500
       );
     } else if (err === 'EMPTY_LATEX') {
       pushToast('error', '识别失败：识别服务未返回 latex。', 4500);
     } else {
       pushToast('error', `公式识别失败（${err}${status ? `, HTTP ${status}` : ''}），请重试或手动编辑。`, 5200);
-    }
-
-    if (canvas) {
-      const textbox = new fabric.Textbox('', {
-        left: cropLeft,
-        top: cropTop,
-        width: Math.max(220, Math.min(520, cropWidth)),
-        fontSize: 22,
-        fill: '#000000',
-        backgroundColor: 'rgba(255,255,255,0.8)',
-        borderColor: '#93c5fd',
-        cornerColor: '#3b82f6',
-        padding: 6,
-        editable: false
-      });
-      textbox.isFormula = true;
-      textbox.latex = '';
-      textbox.excludeFromExport = false;
-      canvas.add(textbox);
-      canvas.setActiveObject(textbox);
-      canvas.requestRenderAll();
-      setTimeout(() => {
-        if (!textbox.id) return;
-        openFormulaEditor(textbox);
-      }, 0);
     }
     return;
   }
@@ -2428,37 +2886,18 @@ const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
     return;
   }
 
-  const textbox = new fabric.Textbox(latex, {
-    left: cropLeft,
-    top: cropTop,
-    width: Math.max(220, Math.min(520, cropWidth)),
-    fontSize: 22,
-    fill: '#000000',
-    backgroundColor: 'rgba(255,255,255,0.8)',
-    borderColor: '#93c5fd',
-    cornerColor: '#3b82f6',
-    padding: 6,
-    editable: false
-  });
-  textbox.isFormula = true;
-  textbox.latex = latex;
-  textbox.excludeFromExport = false;
-
-  canvas.add(textbox);
-  canvas.setActiveObject(textbox);
-  canvas.requestRenderAll();
-
-  setTimeout(() => {
-    if (!textbox.id) return;
-    openFormulaEditor(textbox);
-  }, 0);
+  const safeZoom = typeof zoom === 'number' && Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+  const padScene = padPx / safeZoom;
+  const cropLeft = left - padScene;
+  const cropTop = top - padScene;
+  await openFormulaInsertPreview({ latex, left: cropLeft, top: cropTop, fontSize: 22 });
 };
 
 const handleFormulaRecognizeMouseDown = (e) => {
   if (isFormulaRecognizeMode.value !== true) return;
   if (!canvas) return;
   if (isFormulaRecognizing.value) return;
-  const p = e?.scenePoint;
+  const p = getScenePointFromEvent(e);
   if (!p) return;
 
   formulaRecognizeStartPoint = { x: p.x, y: p.y };
@@ -2490,7 +2929,7 @@ const handleFormulaRecognizeMouseMove = (e) => {
   if (isFormulaRecognizeMode.value !== true) return;
   if (!canvas) return;
   if (!formulaRecognizeRect || !formulaRecognizeStartPoint) return;
-  const p = e?.scenePoint;
+  const p = getScenePointFromEvent(e);
   if (!p) return;
 
   const x0 = formulaRecognizeStartPoint.x;
@@ -2546,14 +2985,62 @@ const closeFormulaEditor = async (releaseLock = true) => {
   }
 
   isFormulaEditorOpen.value = false;
+  isFormulaInsertPreviewOpen.value = false;
+  formulaInsertPending = null;
   formulaEditorValue.value = '';
   formulaEditingObjectId = null;
   formulaEditingBeforeJson = null;
   formulaEditingLockResourceId = null;
+  setFormulaOverlayVisible(true);
 };
 
 const saveFormulaEditor = async () => {
   if (!canvas) return;
+  if (isFormulaInsertPreviewOpen.value === true) {
+    const latexSrc = normalizeLatexForKatex(formulaEditorValue.value);
+    if (!latexSrc) {
+      pushToast('warning', '请输入 LaTeX 公式后再添加。', 3600);
+      return;
+    }
+    const pending = formulaInsertPending && typeof formulaInsertPending === 'object' ? formulaInsertPending : null;
+    const left = pending && typeof pending.left === 'number' ? pending.left : 200;
+    const top = pending && typeof pending.top === 'number' ? pending.top : 150;
+    const fontSize = pending && typeof pending.fontSize === 'number' ? pending.fontSize : 22;
+    const size = measureFormulaSize(latexSrc, fontSize);
+    const pad = 6;
+    const w = (size ? size.w : 260) + pad * 2;
+    const h = (size ? size.h : 60) + pad * 2;
+    const obj = new fabric.Rect({
+      left: left - pad,
+      top: top - pad,
+      width: Math.max(1, w),
+      height: Math.max(1, h),
+      fill: 'rgba(0,0,0,0)',
+      stroke: 'rgba(0,0,0,0)',
+      strokeWidth: 0,
+      borderColor: '#93c5fd',
+      cornerColor: '#3b82f6',
+      selectable: true,
+      evented: true
+    });
+    obj.isFormula = true;
+    obj.latex = latexSrc;
+    obj.text = latexSrc;
+    obj.excludeFromExport = false;
+    obj.formulaFontSize = fontSize;
+    obj.formulaPad = pad;
+    applyFormulaCanvasStyle(obj);
+    canvas.add(obj);
+    finalizeNewObject(obj);
+    updateFormulaOverlayForObject(obj);
+    await closeFormulaEditor(true);
+    currentTool.value = 'select';
+    applyToolMode();
+    canvas.setActiveObject(obj);
+    canvas.requestRenderAll();
+    return;
+  }
+
   if (!formulaEditingObjectId) return;
 
   const obj = objectMap.get(formulaEditingObjectId);
@@ -2563,8 +3050,10 @@ const saveFormulaEditor = async () => {
   }
 
   const beforeJson = formulaEditingBeforeJson || obj.toJSON();
-  obj.latex = formulaEditorValue.value;
-  obj.text = formulaEditorValue.value;
+  obj.latex = normalizeLatexForKatex(formulaEditorValue.value);
+  obj.text = obj.latex;
+  applyFormulaCanvasStyle(obj);
+  updateFormulaOverlayForObject(obj);
 
   obj.setCoords();
   canvas.requestRenderAll();
@@ -2605,11 +3094,14 @@ const openFormulaEditor = async (obj) => {
 
   obj.editable = false;
   await closeFormulaEditor(false);
+  isFormulaInsertPreviewOpen.value = false;
+  formulaInsertPending = null;
+  setFormulaOverlayVisible(false);
 
   formulaEditingObjectId = obj.id;
   formulaEditingBeforeJson = obj.toJSON();
   formulaEditingLockResourceId = resourceId;
-  formulaEditorValue.value = typeof obj.latex === 'string' ? obj.latex : (obj.text || '');
+  formulaEditorValue.value = normalizeLatexForKatex(typeof obj.latex === 'string' ? obj.latex : (obj.text || ''));
   isFormulaEditorOpen.value = true;
 
   stopFormulaLockRenew();
@@ -2627,6 +3119,22 @@ const openFormulaEditor = async (obj) => {
   }, 5000);
 };
 
+const openFormulaInsertPreview = async ({ latex, left, top, fontSize } = {}) => {
+  await closeFormulaEditor(true);
+  formulaEditingObjectId = null;
+  formulaEditingBeforeJson = null;
+  formulaEditingLockResourceId = null;
+  isFormulaInsertPreviewOpen.value = true;
+  formulaInsertPending = {
+    left: typeof left === 'number' ? left : 200,
+    top: typeof top === 'number' ? top : 150,
+    fontSize: typeof fontSize === 'number' ? fontSize : 22
+  };
+  formulaEditorValue.value = normalizeLatexForKatex(latex || '');
+  isFormulaEditorOpen.value = true;
+  setFormulaOverlayVisible(false);
+};
+
 const insertFormula = () => {
   if (!canvas) return;
 
@@ -2635,8 +3143,8 @@ const insertFormula = () => {
     top: 150,
     width: 260,
     fontSize: 22,
-    fill: '#000000',
-    backgroundColor: 'rgba(255,255,255,0.8)',
+    fill: 'rgba(0,0,0,0)',
+    backgroundColor: 'rgba(0,0,0,0)',
     borderColor: '#93c5fd',
     cornerColor: '#3b82f6',
     padding: 6,
@@ -2644,11 +3152,14 @@ const insertFormula = () => {
   });
   textbox.isFormula = true;
   textbox.latex = '';
+  textbox.text = '';
   textbox.excludeFromExport = false;
+  applyFormulaCanvasStyle(textbox);
 
   canvas.add(textbox);
   canvas.setActiveObject(textbox);
   canvas.requestRenderAll();
+  updateFormulaOverlayForObject(textbox);
 
   setTimeout(() => {
     if (!textbox.id) return;
@@ -2658,6 +3169,34 @@ const insertFormula = () => {
 
 // --- 方法：处理本地鼠标移动 (节流发送) ---
 let lastCursorSend = 0;
+let cursorSendSeq = 0;
+let cursorSendRafId = 0;
+let pendingCursorPoint = null;
+const CURSOR_SEND_INTERVAL_MS = 33;
+
+const scheduleCursorSend = () => {
+  if (cursorSendRafId) return;
+  cursorSendRafId = requestAnimationFrame(() => {
+    cursorSendRafId = 0;
+    if (!pendingCursorPoint) return;
+    const now = performance.now();
+    if (now - lastCursorSend < CURSOR_SEND_INTERVAL_MS) {
+      scheduleCursorSend();
+      return;
+    }
+    lastCursorSend = now;
+    cursorSendSeq += 1;
+    const p = pendingCursorPoint;
+    pendingCursorPoint = null;
+    socketService.emit('cursor-move', {
+      roomId: ROOM_ID,
+      x: p.x,
+      y: p.y,
+      userName: myName.value,
+      seq: cursorSendSeq
+    });
+  });
+};
 
 // --- Ghost Brush：发送端降载（批量点发送）---
 //
@@ -2767,93 +3306,133 @@ const renderGhostPath = (raw) => {
 };
 
 // --- 方法：更新远程光标 ---
-const updateRemoteCursor = ({ userId, x, y, userName }) => {
-  let cursor = cursorMap.get(userId);
+const updateRemoteCursor = ({ userId, x, y, userName, seq }) => {
+  if (!userId) return;
+  if (!canvas) return;
+  const nx = toFiniteNumber(x);
+  const ny = toFiniteNumber(y);
+  if (nx === null || ny === null) return;
+
+  let cursor = remoteCursorMap.get(userId);
 
   if (!cursor) {
-    // 创建光标元素 (使用 HTML DOM 覆盖在 Canvas 上)
-    const el = document.createElement('div');
-    // 设置基础样式：绝对定位，不阻挡鼠标事件，过渡效果
-    el.className = 'qb-remote-cursor absolute relative pointer-events-none transition-transform duration-100 ease-linear z-50 flex flex-col items-center';
-
     const c = getStableUserColor(userId);
-    el.style.setProperty('--qb-cursor-solid', c.solid);
-    el.style.setProperty('--qb-cursor-soft', c.soft);
-    el.style.setProperty('--qb-cursor-glow', c.glow);
-
-    el.innerHTML = `
-      <div class="qb-cursor-halo"></div>
-      <div class="qb-cursor-tail" style="width: 2px; height: 18px; border-radius: 999px; background: linear-gradient(to top, ${c.solid}, transparent); box-shadow: 0 0 16px ${c.glow};" />
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="filter: drop-shadow(0 4px 10px ${c.soft});">
-        <path d="M5.65376 12.3673H5.46026L5.31717 12.4976L0.500002 16.8829L0.500002 1.19177L11.7841 12.3673H5.65376Z" fill="${c.solid}" stroke="white" stroke-width="1.5"/>
-      </svg>
-      <span class="text-white text-[10px] px-1.5 py-0.5 rounded-full shadow-sm mt-0.5 whitespace-nowrap" style="background: ${c.solid}; box-shadow: 0 0 18px ${c.soft};">${userName || userId.slice(0, 4)}</span>
-    `;
-
-    // 强制设置初始位置为 0,0，防止 translate 偏移错误
-    el.style.left = '0px';
-    el.style.top = '0px';
-
-    // 将光标添加到 Canvas 容器的父级
-    if (canvasEl.value && canvasEl.value.parentElement) {
-      canvasEl.value.parentElement.appendChild(el);
-      cursor = { el, x: 0, y: 0 };
-      cursorMap.set(userId, cursor);
-    } else {
-      return;
+    const pointer = new fabric.Path('M0 0 L0 20 L5 14 L8 23 L10.5 22 L7.6 13 L16 13 Z', {
+      fill: c.solid,
+      originX: 'left',
+      originY: 'top',
+      left: 0,
+      top: 0,
+      selectable: false,
+      evented: false
+    });
+    pointer.shadow = new fabric.Shadow({
+      color: 'rgba(2,6,23,0.28)',
+      blur: 7,
+      offsetX: 0,
+      offsetY: 3
+    });
+    const labelBg = new fabric.Rect({
+      left: REMOTE_CURSOR_LABEL_OFFSET_X,
+      top: REMOTE_CURSOR_LABEL_OFFSET_Y,
+      originX: 'center',
+      originY: 'top',
+      width: 24,
+      height: 16,
+      rx: REMOTE_CURSOR_LABEL_RADIUS,
+      ry: REMOTE_CURSOR_LABEL_RADIUS,
+      fill: getRemoteCursorLabelBgFill(c.hue),
+      stroke: getRemoteCursorLabelBgStroke(c.hue),
+      strokeWidth: 1,
+      selectable: false,
+      evented: false
+    });
+    labelBg.shadow = new fabric.Shadow({
+      color: 'rgba(2,6,23,0.10)',
+      blur: 6,
+      offsetX: 0,
+      offsetY: 4
+    });
+    const label = new fabric.Text(userName || userId.slice(0, 4), {
+      fontSize: 11,
+      fill: REMOTE_CURSOR_LABEL_TEXT,
+      originX: 'center',
+      originY: 'top',
+      left: REMOTE_CURSOR_LABEL_OFFSET_X,
+      top: REMOTE_CURSOR_LABEL_OFFSET_Y + REMOTE_CURSOR_LABEL_PAD_Y,
+      fontFamily: 'system-ui',
+      fontWeight: '400',
+      selectable: false,
+      evented: false
+    });
+    label.shadow = null;
+    const group = new fabric.Group([pointer, labelBg, label], {
+      left: nx,
+      top: ny,
+      originX: 'left',
+      originY: 'top',
+      selectable: false,
+      evented: false,
+      hasControls: false,
+      hasBorders: false,
+      excludeFromExport: true
+    });
+    group.__isGhost = true;
+    canvas.add(group);
+    if (typeof canvas.bringObjectToFront === 'function') {
+      canvas.bringObjectToFront(group);
     }
+    cursor = {
+      obj: group,
+      labelObj: label,
+      labelBgObj: labelBg,
+      tx: nx,
+      ty: ny,
+      cx: nx,
+      cy: ny,
+      lastSeq: null,
+      lastSeenAt: 0,
+      lastRenderAt: 0,
+      snapNext: true,
+      lastScale: null
+    };
+    remoteCursorMap.set(userId, cursor);
+    updateRemoteCursorLabel(cursor, userId, userName);
   }
 
-  // 光标标签（昵称）需要可更新：
-  // - 初次创建时会写入 userName；
-  // - 但如果用户中途修改昵称（user-name 事件），或者 cursor-move 带了新名字，
-  //   我们希望不用等“光标重建”也能更新文字。
-  const span = cursor && cursor.el ? cursor.el.querySelector('span') : null;
-  if (span) {
-    span.textContent = userName || userId.slice(0, 4);
-  }
+  updateRemoteCursorLabel(cursor, userId, userName);
 
-  // 存储远端光标的“世界坐标（canvas 坐标）”，在视图平移/缩放时可用来重新计算屏幕位置
-  cursor.x = x;
-  cursor.y = y;
-
-  applyRemoteCursorTransform(cursor);
-};
-
-/**
- * 将远端光标的“世界坐标”映射到当前视图的“屏幕坐标”，并更新 DOM 位置。
- * 说明：
- * - 协同传输的是世界坐标（对象/路径同一坐标系）；
- * - 每个客户端 viewportTransform 不同，所以必须在渲染阶段做一次变换。
- */
-const applyRemoteCursorTransform = (cursor) => {
-  if (!cursor?.el) return;
-  if (!canvas) return;
-
-  const vpt = canvas.viewportTransform;
-  const worldPoint = new fabric.Point(cursor.x || 0, cursor.y || 0);
-  const screenPoint = vpt ? fabric.util.transformPoint(worldPoint, vpt) : worldPoint;
-
-  cursor.el.style.left = '0px';
-  cursor.el.style.top = '0px';
-  cursor.el.style.transform = `translate(${screenPoint.x}px, ${screenPoint.y}px)`;
+  if (!shouldAcceptMonotonicSeq(cursor.lastSeq, seq)) return;
+  if (typeof seq === 'number' && Number.isFinite(seq)) cursor.lastSeq = Math.floor(seq);
+  cursor.tx = nx;
+  cursor.ty = ny;
+  cursor.lastSeenAt = performance.now();
+  ensureRemoteCursorLoop();
+  renderRemoteCursorsOnce(false);
 };
 
 /**
  * 当视图发生变化（平移/缩放）时，刷新所有远端光标的位置。
  */
 const refreshRemoteCursors = () => {
-  for (const cursor of cursorMap.values()) {
-    applyRemoteCursorTransform(cursor);
+  for (const cursor of remoteCursorMap.values()) {
+    if (cursor) cursor.snapNext = true;
   }
+  renderRemoteCursorsOnce(true);
 };
 
 // --- 方法：移除远程光标 ---
 const removeRemoteCursor = (userId) => {
-  const cursor = cursorMap.get(userId);
+  const cursor = remoteCursorMap.get(userId);
   if (cursor) {
-    cursor.el.remove();
-    cursorMap.delete(userId);
+    if (cursor.obj && canvas) {
+      canvas.remove(cursor.obj);
+    }
+    remoteCursorMap.delete(userId);
+    if (remoteCursorMap.size === 0 && remoteCursorRafId) {
+      cancelAnimationFrame(remoteCursorRafId);
+      remoteCursorRafId = 0;
+    }
   }
 };
 
@@ -2963,9 +3542,16 @@ const handleRemoteUpdate = (crdtState) => {
 const handleResize = () => {
   viewportWidth.value = window.innerWidth;
   if (canvas) {
-    canvas.setWidth(window.innerWidth);
-    canvas.setHeight(window.innerHeight);
-    canvas.renderAll();
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    if (typeof canvas.setDimensions === 'function') {
+      canvas.setDimensions({ width: w, height: h });
+    } else {
+      if (typeof canvas.setWidth === 'function') canvas.setWidth(w);
+      if (typeof canvas.setHeight === 'function') canvas.setHeight(h);
+    }
+    if (typeof canvas.calcOffset === 'function') canvas.calcOffset();
+    canvas.requestRenderAll();
     scheduleViewportStatsUpdate();
   }
 };
@@ -3004,7 +3590,7 @@ const applyToolMode = () => {
   if (currentTool.value === 'eraser') {
     applyEraserHoverCursorOverride(true);
     canvas.selection = false;
-    canvas.skipTargetFind = false;
+    canvas.skipTargetFind = true;
     setCanvasCursor(QB_CURSOR_ERASER);
     canvas.discardActiveObject();
     canvas.requestRenderAll();
@@ -3757,6 +4343,14 @@ const exportJson = () => {
               <div class="flex flex-wrap items-center gap-1">
                 <div class="text-xs font-medium text-gray-600 mr-2">操作</div>
 
+                <button @click="performUndo" :class="simpleBtnClass()" title="撤销 (Ctrl+Z)">
+                  <span v-if="!toolbarCompact">撤销</span>
+                </button>
+
+                <button @click="performRedo" :class="simpleBtnClass()" title="重做 (Ctrl+Y / Ctrl+Shift+Z)">
+                  <span v-if="!toolbarCompact">重做</span>
+                </button>
+
                 <button @click="exportPng" :class="simpleBtnClass()" title="导出 PNG（当前视图）">
                   <span v-if="!toolbarCompact">PNG</span>
                 </button>
@@ -4026,9 +4620,9 @@ const exportJson = () => {
       </div>
     </div>
 
-    <div v-if="isFormulaEditorOpen" class="absolute inset-0 bg-black/30 flex items-center justify-center pointer-events-auto">
+    <div v-if="isFormulaEditorOpen" class="absolute inset-0 z-40 bg-black/30 flex items-center justify-center pointer-events-auto">
       <div class="w-[min(720px,92vw)] bg-white rounded-lg shadow-xl border border-gray-200 p-4">
-        <div class="text-sm font-medium text-gray-700 mb-2">编辑公式（LaTeX）</div>
+        <div class="text-sm font-medium text-gray-700 mb-2">{{ formulaEditorTitle }}</div>
         <textarea
           v-model="formulaEditorValue"
           class="w-full h-40 p-2 border border-gray-200 rounded text-sm font-mono outline-none focus:ring-2 focus:ring-blue-200"
@@ -4043,7 +4637,7 @@ const exportJson = () => {
             取消
           </button>
           <button @click="saveFormulaEditor" class="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm">
-            保存
+            {{ formulaEditorOkText }}
           </button>
         </div>
       </div>
@@ -4052,11 +4646,11 @@ const exportJson = () => {
 </template>
 
 <style scoped>
-.qb-remote-cursor {
+:global(.qb-remote-cursor) {
   will-change: transform;
 }
 
-.qb-remote-cursor .qb-cursor-halo {
+:global(.qb-remote-cursor) .qb-cursor-halo {
   position: absolute;
   width: 36px;
   height: 36px;

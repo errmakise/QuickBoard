@@ -170,7 +170,7 @@ onUnmounted(() => {
                 <input
                   v-model="joinInput"
                   class="qb-input flex-1"
-                  placeholder="输入房间号（如 K7M2-9QF4），或粘贴邀请链接"
+                  placeholder="输入房间号（10 位数字），或粘贴邀请链接"
                   @keydown.enter="joinRoom"
                 />
                 <button
