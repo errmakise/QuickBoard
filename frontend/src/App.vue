@@ -13,7 +13,11 @@ import { RouterView } from 'vue-router'
     </div>
 
     <div class="relative h-full w-full">
-      <RouterView />
+      <RouterView v-slot="{ Component, route }">
+        <Transition name="qb-route-fade" mode="in-out">
+          <component :is="Component" :key="route.fullPath" />
+        </Transition>
+      </RouterView>
     </div>
   </div>
 </template>

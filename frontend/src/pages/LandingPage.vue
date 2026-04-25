@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { addRecentRoom, generateRoomId, normalizeRoomIdInput, readRecentRooms, removeRecentRoom } from '../utils/rooms'
 
@@ -12,31 +12,59 @@ const recentRooms = ref([])
 const rootEl = ref(null)
 
 const isJoinShaking = ref(false)
-let mouseRaf = 0
-let detachMouseMove = null
+const isNavigating = ref(false)
+const navFx = ref({ on: false, x: 0, y: 0 })
 
-const shortcutHint = computed(() => {
-  return '极简上手：创建房间 → 复制链接 → 开始一起涂鸦'
-})
+let mouseRaf = 0
+let detachMouse = null
 
 const refreshRecent = () => {
   recentRooms.value = readRecentRooms()
 }
 
-const goBoard = async (roomId) => {
+const beginNavFx = (x, y) => {
+  navFx.value = { on: true, x, y }
+}
+
+const endNavFx = () => {
+  navFx.value = { ...navFx.value, on: false }
+}
+
+const goBoard = async (roomId, { fx } = {}) => {
   const id = String(roomId || '').trim()
   if (!id) return
   addRecentRoom(id)
-  await router.push({ name: 'board', query: { room: id } })
+
+  if (isNavigating.value) return
+  isNavigating.value = true
+
+  try {
+    if (fx && typeof fx.x === 'number' && typeof fx.y === 'number') {
+      beginNavFx(fx.x, fx.y)
+      await new Promise((r) => setTimeout(r, 180))
+    }
+
+    const next = () => router.push({ name: 'board', query: { room: id } })
+    if (typeof document !== 'undefined' && typeof document.startViewTransition === 'function') {
+      await document.startViewTransition(() => next()).finished
+    } else {
+      await next()
+    }
+  } finally {
+    isNavigating.value = false
+    endNavFx()
+  }
 }
 
-const createRoom = async () => {
+const createRoom = async (e) => {
   errorText.value = ''
   const roomId = generateRoomId()
-  await goBoard(roomId)
+
+  const fx = e && e.clientX != null && e.clientY != null ? { x: e.clientX, y: e.clientY } : null
+  await goBoard(roomId, { fx })
 }
 
-const joinRoom = async () => {
+const joinRoom = async (e) => {
   errorText.value = ''
   const id = normalizeRoomIdInput(joinInput.value)
   if (!id) {
@@ -47,11 +75,13 @@ const joinRoom = async () => {
     }, 460)
     return
   }
-  await goBoard(id)
+  const fx = e && e.clientX != null && e.clientY != null ? { x: e.clientX, y: e.clientY } : null
+  await goBoard(id, { fx })
 }
 
-const openRecent = async (roomId) => {
-  await goBoard(roomId)
+const openRecent = async (roomId, e) => {
+  const fx = e && e.clientX != null && e.clientY != null ? { x: e.clientX, y: e.clientY } : null
+  await goBoard(roomId, { fx })
 }
 
 const removeRecent = (roomId) => {
@@ -62,9 +92,10 @@ const removeRecent = (roomId) => {
 onMounted(async () => {
   refreshRecent()
 
+  const prefersReduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches
   const host = rootEl.value
   const handleMove = (e) => {
-    if (!host) return
+    if (!host || prefersReduced) return
     if (mouseRaf) return
     mouseRaf = window.requestAnimationFrame(() => {
       mouseRaf = 0
@@ -76,18 +107,9 @@ onMounted(async () => {
     })
   }
 
-  const handleLeave = () => {
-    host.style.setProperty('--mx', `50%`)
-    host.style.setProperty('--my', `10%`)
-  }
-
   if (host) {
     host.addEventListener('mousemove', handleMove)
-    host.addEventListener('mouseleave', handleLeave)
-    detachMouseMove = () => {
-      host.removeEventListener('mousemove', handleMove)
-      host.removeEventListener('mouseleave', handleLeave)
-    }
+    detachMouse = () => host.removeEventListener('mousemove', handleMove)
   }
 
   const q = route.query || {}
@@ -99,9 +121,9 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  if (typeof detachMouseMove === 'function') {
-    detachMouseMove()
-    detachMouseMove = null
+  if (typeof detachMouse === 'function') {
+    detachMouse()
+    detachMouse = null
   }
   if (mouseRaf) {
     window.cancelAnimationFrame(mouseRaf)
@@ -111,126 +133,90 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="rootEl" class="relative h-full w-full overflow-auto" style="--mx:50%;--my:10%;">
+  <div ref="rootEl" class="relative h-full w-full overflow-hidden bg-[#F8F9FB] text-slate-900" style="--mx:50%;--my:45%;">
+    <div class="pointer-events-none absolute inset-0 qb-home-grid" />
     <div class="pointer-events-none absolute inset-0">
-      <div
-        class="absolute inset-0"
-        style="background: radial-gradient(520px circle at var(--mx) var(--my), rgba(59,130,246,0.18), transparent 62%), radial-gradient(520px circle at calc(var(--mx) - 240px) calc(var(--my) + 140px), rgba(168,85,247,0.14), transparent 62%);"
-      />
+      <div class="absolute inset-0 qb-home-glow" />
     </div>
 
-    <div class="pointer-events-none absolute inset-0">
-      <div class="absolute top-16 left-1/2 h-28 w-[min(760px,92vw)] -translate-x-1/2 rounded-full bg-blue-200/30 blur-3xl animate-qb-float" />
-      <div class="absolute top-28 left-1/2 h-28 w-[min(760px,92vw)] -translate-x-1/2 rounded-full bg-purple-200/25 blur-3xl animate-qb-float" style="animation-delay:-2.4s" />
+    <div v-if="navFx.on" class="pointer-events-none fixed inset-0 z-[60]">
+      <div class="absolute inset-0 qb-board-fx" :style="{ '--fx-x': navFx.x + 'px', '--fx-y': navFx.y + 'px' }" />
     </div>
 
-    <div class="mx-auto w-full max-w-5xl px-4 py-10">
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-3">
-          <div class="relative h-11 w-11 rounded-2xl border border-gray-200/80 bg-white/70 shadow-sm backdrop-blur flex items-center justify-center">
-            <span class="text-lg">✏️</span>
-            <div class="pointer-events-none absolute -inset-1 rounded-[18px] bg-gradient-to-b from-blue-200/35 to-purple-200/25 blur" />
-          </div>
-          <div>
-            <div class="text-base font-semibold tracking-tight">QuickBoard</div>
-            <div class="text-xs text-gray-500">极简 · 轻量高效 · 趣味驱动</div>
-          </div>
+    <header class="relative z-10 h-14">
+      <div class="mx-auto flex h-full w-full max-w-6xl items-center justify-between px-4">
+        <div class="inline-flex items-center gap-2 text-sm font-semibold tracking-tight text-slate-900">
+          <span class="h-7 w-7 rounded-xl border border-black/10 bg-white/70 shadow-sm" />
+          QuickBoard
         </div>
       </div>
+    </header>
 
-      <div class="mt-10 grid grid-cols-1 lg:grid-cols-[1.2fr_0.8fr] gap-6">
-        <div class="qb-card p-6">
-          <div class="flex items-start justify-between gap-4">
-            <div>
-              <div class="text-sm font-medium text-gray-900">开始协作</div>
-              <div class="mt-1 text-sm text-gray-600">打开即用，无需注册。房间就是链接。</div>
-            </div>
-            <div class="hidden sm:flex items-center gap-2">
-              <span class="rounded-full border border-gray-200 bg-white/70 px-2.5 py-1 text-[11px] text-gray-600">多人协作</span>
-              <span class="rounded-full border border-gray-200 bg-white/70 px-2.5 py-1 text-[11px] text-gray-600">公式识别</span>
-              <span class="rounded-full border border-gray-200 bg-white/70 px-2.5 py-1 text-[11px] text-gray-600">撤销重做</span>
-            </div>
-          </div>
+    <main class="relative z-10 w-full px-4">
+      <div class="mx-auto flex min-h-[calc(100vh-56px)] w-full max-w-6xl items-center py-10 sm:py-14">
+        <div class="mx-auto w-full max-w-2xl text-center">
+          <h1 class="text-4xl sm:text-6xl font-semibold tracking-tight leading-[1.02]">
+            速绘板，
+            <span class="qb-home-slogan">一起更快</span>
+          </h1>
+          <p class="mt-4 text-sm sm:text-base text-slate-600">创建一个房间，分享链接，立即开始一起画。</p>
 
-          <div class="mt-4 flex flex-col gap-2">
-            <button
-              @click="createRoom"
-              class="qb-btn qb-btn-primary h-11"
-            >
-              <span class="text-base">✨</span>
-              创建新房间
+          <div class="mt-8">
+            <button class="qb-cta h-12 w-full rounded-2xl text-base" :disabled="isNavigating" @click="createRoom">
+              {{ isNavigating ? '进入中…' : '创建房间' }}
             </button>
 
-            <div
-              class="rounded-2xl border border-gray-200/80 bg-white/70 p-4 shadow-sm"
-              :class="{ 'animate-qb-shake': isJoinShaking }"
-            >
-              <div class="text-xs text-gray-500">加入房间</div>
-              <div class="mt-2 flex gap-2">
+            <div class="mt-4 rounded-2xl border border-black/10 bg-white/70 px-4 py-3 shadow-sm" :class="{ 'animate-qb-shake': isJoinShaking }">
+              <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
                 <input
                   v-model="joinInput"
                   class="qb-input flex-1"
-                  placeholder="输入房间号（10 位数字），或粘贴邀请链接"
+                  placeholder="粘贴房间链接或输入 roomId"
                   @keydown.enter="joinRoom"
                 />
-                <button
-                  @click="joinRoom"
-                  class="qb-btn h-10 px-4"
-                >
-                  进入
-                </button>
+                <button class="qb-btn qb-btn-primary h-10 px-4" @click="joinRoom">加入</button>
               </div>
-              <div v-if="errorText" class="mt-2 text-xs text-red-600">{{ errorText }}</div>
+              <div v-if="errorText" class="mt-2 text-left text-xs text-red-600">{{ errorText }}</div>
             </div>
-          </div>
 
-          <div class="mt-4 text-xs text-gray-500">{{ shortcutHint }}</div>
-          <div class="mt-2 text-xs text-gray-500">小贴士：在白板里按 <span class="font-mono">?</span> 查看快捷键。</div>
-        </div>
-
-        <div class="qb-card p-6">
-          <div class="flex items-center justify-between">
-            <div class="text-sm font-medium text-gray-900">最近房间</div>
-          </div>
-          <div class="mt-1 text-sm text-gray-600">一键回到你刚才的协作现场。</div>
-
-          <div v-if="!recentRooms.length" class="mt-6 text-sm text-gray-500">
-            还没有记录。创建一个房间开始吧。
-          </div>
-
-          <div v-else class="mt-4 flex flex-col gap-2">
-            <div
-              v-for="r in recentRooms"
-              :key="r.roomId"
-              class="group rounded-2xl border border-gray-200/80 bg-white/70 px-4 py-3 flex items-center justify-between gap-3 shadow-sm transition hover:shadow-md"
-            >
-              <button
-                class="flex-1 text-left"
-                @click="openRecent(r.roomId)"
-                :title="r.roomId"
-              >
-                <div class="flex items-center gap-2">
-                  <div class="text-sm font-medium text-gray-900 truncate">{{ r.roomId }}</div>
-                  <span class="text-[11px] text-gray-400 opacity-0 group-hover:opacity-100 transition">↩</span>
+            <div v-if="recentRooms.length" class="mt-5">
+              <div class="flex items-center justify-between">
+                <div class="text-xs font-semibold text-slate-700">最近房间</div>
+                <button class="text-xs text-slate-500 hover:text-slate-700 transition" @click="refreshRecent">刷新</button>
+              </div>
+              <div class="mt-3 flex flex-wrap justify-center gap-2">
+                <div
+                  v-for="r in recentRooms.slice(0, 6)"
+                  :key="r.roomId"
+                  class="group inline-flex items-center gap-2 rounded-full border border-black/10 bg-white/70 px-3 py-1.5 text-sm text-slate-800 shadow-sm"
+                >
+                  <svg
+                    class="h-4 w-4 text-slate-900"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    xmlns="http://www.w3.org/2000/svg"
+                    aria-hidden="true"
+                  >
+                    <path
+                      d="M4 7.5C4 6.11929 5.11929 5 6.5 5H17.5C18.8807 5 20 6.11929 20 7.5V18.5C20 19.8807 18.8807 21 17.5 21H6.5C5.11929 21 4 19.8807 4 18.5V7.5Z"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                    />
+                    <path d="M10 8.5H14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                    <path d="M10 12H14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                    <path d="M10 15.5H14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                  </svg>
+                  <button class="max-w-[220px] truncate" :title="r.roomId" @click="(e) => openRecent(r.roomId, e)">
+                    {{ r.roomId }}
+                  </button>
+                  <button class="text-slate-400 hover:text-slate-600 transition" @click="removeRecent(r.roomId)">×</button>
                 </div>
-                <div class="text-xs text-gray-500">上次进入：{{ r.lastJoinedAt ? new Date(r.lastJoinedAt).toLocaleString() : '未知' }}</div>
-              </button>
-
-              <button
-                class="h-9 px-3 rounded-xl text-xs text-gray-500 hover:text-gray-700 hover:bg-white transition"
-                @click="removeRecent(r.roomId)"
-                title="从列表移除"
-              >
-                移除
-              </button>
+              </div>
+              <div class="mt-2 text-center text-[11px] text-slate-400">最近房间保存在浏览器本地存储中。</div>
             </div>
           </div>
         </div>
       </div>
-
-      <div class="mt-8 text-xs text-gray-500">
-        兼容旧链接：<span class="font-mono">/?room=xxx</span> 也会自动跳转到白板。
-      </div>
-    </div>
+    </main>
   </div>
 </template>

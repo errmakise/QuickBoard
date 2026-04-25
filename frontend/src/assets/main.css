@@ -154,6 +154,162 @@
   .qb-ring-enter {
     animation: qb-ring-enter 160ms ease-out;
   }
+
+  .qb-route-fade-enter-active,
+  .qb-route-fade-leave-active {
+    transition: opacity 180ms ease, filter 180ms ease, transform 180ms ease;
+  }
+
+  .qb-route-fade-leave-active {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .qb-route-fade-enter-from,
+  .qb-route-fade-leave-to {
+    opacity: 0;
+    filter: blur(6px);
+    transform: scale(0.992);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .qb-route-fade-enter-active,
+    .qb-route-fade-leave-active {
+      transition: none;
+    }
+  }
+
+  .qb-cta {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.98);
+    background: radial-gradient(900px circle at 50% 10%, rgba(255, 255, 255, 0.18), transparent 48%),
+      linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(2, 6, 23, 0.98));
+    box-shadow: 0 18px 52px -28px rgba(2, 6, 23, 0.62), 0 0 0 1px rgba(148, 163, 184, 0.18) inset;
+    transition: transform 160ms ease, box-shadow 160ms ease, filter 160ms ease;
+    isolation: isolate;
+  }
+
+  .qb-cta::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    background: linear-gradient(90deg, rgba(56, 189, 248, 0.35), rgba(168, 85, 247, 0.35));
+    filter: blur(10px);
+    opacity: 0.55;
+    z-index: -1;
+    transition: opacity 160ms ease;
+  }
+
+  .qb-cta::after {
+    content: '';
+    position: absolute;
+    inset: 1px;
+    border-radius: inherit;
+    background: linear-gradient(
+      120deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.18) 14%,
+      transparent 28%
+    );
+    transform: translateX(-45%);
+    opacity: 0;
+    transition: opacity 160ms ease;
+    pointer-events: none;
+  }
+
+  .qb-cta:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 22px 62px -30px rgba(2, 6, 23, 0.68), 0 0 0 1px rgba(148, 163, 184, 0.22) inset;
+    filter: brightness(1.02);
+  }
+
+  .qb-cta:hover::before {
+    opacity: 0.85;
+  }
+
+  .qb-cta:hover::after {
+    opacity: 1;
+    animation: qb-cta-sheen 820ms ease-out;
+  }
+
+  .qb-cta:active {
+    transform: translateY(0);
+  }
+
+  .qb-cta:disabled {
+    opacity: 0.75;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  @keyframes qb-cta-sheen {
+    0% {
+      transform: translateX(-45%);
+    }
+    100% {
+      transform: translateX(45%);
+    }
+  }
+
+  .qb-home-slogan {
+    background: linear-gradient(90deg, rgba(14, 165, 233, 0.95), rgba(124, 58, 237, 0.95));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    text-shadow: 0 10px 30px rgba(124, 58, 237, 0.12);
+  }
+
+  .qb-home-grid {
+    opacity: 0.55;
+    background-image:
+      linear-gradient(rgba(0, 0, 0, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 0, 0, 0.035) 1px, transparent 1px);
+    background-size: 44px 44px;
+    mask-image: radial-gradient(70% 70% at 50% 18%, #000 46%, transparent 84%);
+  }
+
+  .qb-home-glow {
+    background:
+      radial-gradient(560px circle at var(--mx) var(--my), rgba(56, 189, 248, 0.10), transparent 62%),
+      radial-gradient(520px circle at calc(var(--mx) - 220px) calc(var(--my) + 120px), rgba(168, 85, 247, 0.08), transparent 64%);
+  }
+
+
+
+  .qb-board-fx {
+    --fx-x: 50vw;
+    --fx-y: 50vh;
+    background:
+      radial-gradient(120px circle at var(--fx-x) var(--fx-y), rgba(255, 255, 255, 0.75), transparent 62%),
+      radial-gradient(640px circle at var(--fx-x) var(--fx-y), rgba(56, 189, 248, 0.22), transparent 60%),
+      radial-gradient(720px circle at var(--fx-x) var(--fx-y), rgba(168, 85, 247, 0.18), transparent 64%),
+      rgba(2, 6, 23, 0.15);
+    animation: qb-board-fx 520ms ease-out forwards;
+  }
+
+  @keyframes qb-board-fx {
+    0% {
+      opacity: 0;
+      transform: scale(0.98);
+      filter: blur(0px);
+    }
+    35% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0;
+      transform: scale(1.02);
+      filter: blur(10px);
+    }
+  }
 }
 
 @layer components {

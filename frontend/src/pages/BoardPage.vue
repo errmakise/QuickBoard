@@ -19,6 +19,10 @@ const ensureRoom = async () => {
     return
   }
   addRecentRoom(roomId.value)
+
+  if (typeof window !== 'undefined') {
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+  }
 }
 
 watch(roomId, async () => {
@@ -35,4 +39,3 @@ onMounted(async () => {
     <Whiteboard />
   </div>
 </template>
-

@@ -66,7 +66,6 @@ const applyRenderPerfDefaultsToObject = (obj) => {
 let lastActiveObjectForCaching = null;
 const syncActiveObjectCaching = () => {
   if (!canvas) return;
-  const cfg = getActiveRenderPerfConfig();
   if (lastActiveObjectForCaching && lastActiveObjectForCaching !== canvas.getActiveObject?.()) {
     applyRenderPerfDefaultsToObject(lastActiveObjectForCaching);
     lastActiveObjectForCaching = null;
@@ -714,20 +713,6 @@ const performUndo = () => {
   }, 100);
 };
 
-const performRedo = () => {
-  if (undoRedoInProgress) return;
-  undoRedoInProgress = true;
-  isUndoRedo = true;
-
-  historyManager.redo();
-
-  if (undoRedoTimeout) clearTimeout(undoRedoTimeout);
-  undoRedoTimeout = setTimeout(() => {
-    isUndoRedo = false;
-    undoRedoInProgress = false;
-  }, 100);
-};
-
 const finalizeNewObject = (obj) => {
   if (!canvas || !obj) return;
   if (!obj.id) {
@@ -808,11 +793,11 @@ const updateShapeDraft = (point) => {
   const dy = y1 - y0;
 
   if (shapeDraft.type === 'rect') {
-    const left = Math.min(x0, x1);
-    const top = Math.min(y0, y1);
     const w = Math.max(1, Math.abs(dx));
     const h = Math.max(1, Math.abs(dy));
-    shapeDraft.obj.set({ left, top, width: w, height: h });
+    const sx = dx >= 0 ? 1 : -1;
+    const sy = dy >= 0 ? 1 : -1;
+    shapeDraft.obj.set({ left: x0, top: y0, width: w, height: h, originX: 'left', originY: 'top', scaleX: sx, scaleY: sy });
     shapeDraft.obj.setCoords();
     canvas.requestRenderAll();
     return;
@@ -871,6 +856,12 @@ const toolRingItems = computed(() => {
   const stroke = "fill='none' stroke='currentColor' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'";
   return [
     {
+      key: 'select',
+      label: '选择',
+      iconSvg: `<path d='M7 4l10 10-5 1 1 5-2 .6-1-5-5 1V4z' ${stroke}/>` ,
+      action: () => setTool('select')
+    },
+    {
       key: 'pencil',
       label: '画笔',
       iconSvg: `<path d='M4 20h4l10-10-4-4L4 16v4z' ${stroke}/><path d='M13 7l4 4' ${stroke}/>` ,
@@ -911,12 +902,6 @@ const toolRingItems = computed(() => {
       label: '撤销',
       iconSvg: `<path d='M9 14l-4-4 4-4' ${stroke}/><path d='M5 10h9a5 5 0 1 1 0 10h-3' ${stroke}/>` ,
       action: () => performUndo()
-    },
-    {
-      key: 'redo',
-      label: '重做',
-      iconSvg: `<path d='M15 14l4-4-4-4' ${stroke}/><path d='M19 10H10a5 5 0 1 0 0 10h3' ${stroke}/>` ,
-      action: () => performRedo()
     }
   ];
 });
@@ -945,27 +930,6 @@ const toolRingHoverLabel = computed(() => {
   const found = items.find((x) => x && x.key === k);
   return found && typeof found.label === 'string' ? found.label : '';
 });
-
-const getToolRingItemStyle = (idx, total) => {
-  const radius = 84;
-  const step = (Math.PI * 2) / Math.max(1, total);
-  const a = -Math.PI / 2 + idx * step;
-  const dx = Math.cos(a) * radius;
-  const dy = Math.sin(a) * radius;
-  const delay = toolRingVisible.value ? `${idx * 42}ms` : '0ms';
-  const x = toolRingX.value;
-  const y = toolRingY.value;
-  const translate = toolRingVisible.value
-    ? `translate(${x}px, ${y}px) translate(${dx}px, ${dy}px)`
-    : `translate(${x}px, ${y}px) translate(0px, 0px)`;
-  const scale = toolRingVisible.value ? 1 : 0.35;
-  const opacity = toolRingVisible.value ? 1 : 0;
-  return {
-    transform: `${translate} translate(-50%, -50%) scale(${scale})`,
-    opacity,
-    transitionDelay: delay
-  };
-};
 
 const toolRingSize = 220;
 const toolRingCenter = toolRingSize / 2;
@@ -1321,7 +1285,9 @@ const getScenePointFromEvent = (evt) => {
       const x = toFiniteNumber(p && p.x);
       const y = toFiniteNumber(p && p.y);
       if (x !== null && y !== null) return { x, y };
-    } catch {}
+    } catch {
+      void 0;
+    }
   }
   if (evt && evt.e && typeof canvas.getPointer === 'function') {
     try {
@@ -1329,7 +1295,9 @@ const getScenePointFromEvent = (evt) => {
       const x = toFiniteNumber(p && p.x);
       const y = toFiniteNumber(p && p.y);
       if (x !== null && y !== null) return { x, y };
-    } catch {}
+    } catch {
+      void 0;
+    }
   }
   if (evt && evt.e && canvas && canvas.upperCanvasEl) {
     try {
@@ -1346,7 +1314,9 @@ const getScenePointFromEvent = (evt) => {
         const y = toFiniteNumber(world && world.y);
         if (x !== null && y !== null) return { x, y };
       }
-    } catch {}
+    } catch {
+      void 0;
+    }
   }
   return null;
 };
@@ -2729,13 +2699,8 @@ const startFormulaRecognize = () => {
   applyFormulaRecognizeMode(true);
 };
 
-const recognizeMathFromImage = async (imageDataUrl, { signal, debug = false } = {}) => {
-  const primary = await recognizeMathFromImageDataUrl({ imageDataUrl, timeoutMs: 25000, debug: Boolean(debug), signal });
-  if (primary && primary.ok !== true && primary.error === 'EMPTY_LATEX' && debug !== true) {
-    const retry = await recognizeMathFromImageDataUrl({ imageDataUrl, timeoutMs: 25000, debug: true, signal });
-    return retry || primary;
-  }
-  return primary;
+const recognizeMathFromImage = async (imageDataUrl, { signal } = {}) => {
+  return recognizeMathFromImageDataUrl({ imageDataUrl, timeoutMs: 6000, debug: false, signal });
 };
 
 const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
@@ -2822,8 +2787,6 @@ const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
     });
   }
 
-  window.__ocrDebugLastInput = { imageDataUrl, cropLeftV, cropTopV, cropWidthV, cropHeightV, multiplier, rs: safeRs };
-
   if (formulaRecognizeAbortController) {
     try {
       formulaRecognizeAbortController.abort();
@@ -2834,17 +2797,6 @@ const finalizeFormulaRecognize = async ({ left, top, width, height }) => {
   formulaRecognizeAbortController = new AbortController();
   const result = await recognizeMathFromImage(imageDataUrl, { signal: formulaRecognizeAbortController.signal });
   const latex = typeof result?.latex === 'string' ? result.latex : '';
-  const debugProcessed =
-    result && result.debug && typeof result.debug.processedImageDataUrl === 'string'
-      ? result.debug.processedImageDataUrl
-      : '';
-  if (debugProcessed) {
-    window.__ocrDebugLast = result.debug;
-    if (!window.__ocrDebugHintShown) {
-      window.__ocrDebugHintShown = true;
-      pushToast('info', '已生成 OCR 调试图：F12 打开 Console，输入 window.__ocrDebugLast 查看。', 4200);
-    }
-  }
 
   isFormulaRecognizeMode.value = false;
   applyFormulaRecognizeMode(false);
@@ -3904,13 +3856,6 @@ const handleKeydown = (e) => {
     return;
   }
 
-  // 2. 处理重做 (Ctrl+Y 或 Ctrl+Shift+Z)
-  if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'z'))) {
-    e.preventDefault();
-    performRedo();
-    return;
-  }
-
   // 3. 处理删除 (Delete/Backspace)
   if (e.key === 'Delete' || e.key === 'Backspace') {
     // 获取当前选中的所有对象 (可能是单个，也可能是多选)
@@ -3966,6 +3911,9 @@ const handleKeyup = (e) => {
 
 // --- 方法：切换工具 ---
 const setTool = (tool) => {
+  if (isFormulaRecognizeMode.value === true || isFormulaRecognizing.value === true) {
+    cancelFormulaRecognize();
+  }
   currentTool.value = tool;
   if (!canvas) return;
 
@@ -4318,11 +4266,11 @@ const exportJson = () => {
                   <span class="text-sm">橡皮</span>
                 </button>
 
-                <button @click="setTool('rect')" :class="simpleBtnClass()" title="矩形 (R)">
+                <button @click="setTool('rect')" :class="toolBtnClass('rect')" title="矩形 (R)">
                   <span v-if="!toolbarCompact">矩形</span>
                 </button>
 
-                <button @click="setTool('circle')" :class="simpleBtnClass()" title="圆形 (C)">
+                <button @click="setTool('circle')" :class="toolBtnClass('circle')" title="圆形 (C)">
                   <span v-if="!toolbarCompact">圆形</span>
                 </button>
 
@@ -4345,10 +4293,6 @@ const exportJson = () => {
 
                 <button @click="performUndo" :class="simpleBtnClass()" title="撤销 (Ctrl+Z)">
                   <span v-if="!toolbarCompact">撤销</span>
-                </button>
-
-                <button @click="performRedo" :class="simpleBtnClass()" title="重做 (Ctrl+Y / Ctrl+Shift+Z)">
-                  <span v-if="!toolbarCompact">重做</span>
                 </button>
 
                 <button @click="exportPng" :class="simpleBtnClass()" title="导出 PNG（当前视图）">
@@ -4528,8 +4472,6 @@ const exportJson = () => {
             <div class="text-xs font-medium text-gray-700">历史</div>
             <div class="mt-1 text-xs text-gray-600 space-y-1">
               <div><span class="font-mono">Ctrl/⌘ + Z</span> 撤销</div>
-              <div><span class="font-mono">Ctrl/⌘ + Y</span> 重做</div>
-              <div><span class="font-mono">Ctrl/⌘ + Shift + Z</span> 重做</div>
             </div>
           </div>
 
