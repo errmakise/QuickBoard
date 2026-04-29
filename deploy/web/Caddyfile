@@ -1,0 +1,14 @@
+{$DOMAIN:localhost} {
+  handle_path /api/* {
+    reverse_proxy backend:3000
+  }
+
+  handle_path /socket.io/* {
+    reverse_proxy backend:3000
+  }
+
+  root * /srv
+  encode gzip zstd
+  try_files {path} /index.html
+  file_server
+}

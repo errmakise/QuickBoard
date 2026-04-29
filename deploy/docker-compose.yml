@@ -1,0 +1,41 @@
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/web/Dockerfile
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/backend/Dockerfile
+    environment:
+      - PORT=3000
+      - OCR_AUTO_START=0
+      - MATH_OCR_URL=http://ocr:5007/recognize
+    volumes:
+      - ../data/roomStates.json:/app/roomStates.json
+    depends_on:
+      - ocr
+
+  ocr:
+    build:
+      context: ..
+      dockerfile: deploy/ocr/Dockerfile
+    environment:
+      - OCR_WARMUP=0
+    expose:
+      - "5007"
+
+volumes:
+  caddy_data:
+  caddy_config:

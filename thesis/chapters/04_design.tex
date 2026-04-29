@@ -1,0 +1,52 @@
+\chapter{系统设计}\label{chap:design}
+
+本章给出 QuickBoard 的总体架构、模块划分与主要数据流，重点说明“房间入口—白板协作—公式识别”三条主链路的设计取舍。
+
+\section{总体架构}
+QuickBoard 采用前后端分离与服务拆分的架构，整体可分为三部分：前端 Web 应用、后端协作服务与 OCR 服务。前端负责 UI、画布渲染与交互；后端负责房间管理、实时消息与状态同步；OCR 服务负责图像预处理与公式识别推理。该拆分方式便于独立部署与调试，也降低了前端的计算与依赖复杂度。
+
+\begin{figure}[htbp]
+  \centering
+  \fbox{\parbox{0.92\linewidth}{
+    \textbf{Frontend（Vue3 + Fabric）}\quad 5173\newline
+    \hspace*{1em}$\downarrow$ HTTP / WebSocket\newline
+    \textbf{Backend（Node.js + Socket.IO）}\quad 3000\newline
+    \hspace*{1em}$\downarrow$ HTTP 转发\newline
+    \textbf{OCR Service（FastAPI）}\quad 5007
+  }}
+  \caption{QuickBoard 总体架构示意}\label{fig:arch}
+\end{figure}
+
+\section{模块划分}
+\subsection{前端模块}
+\begin{itemize}
+  \item \textbf{首页模块}：提供创建房间、加入房间、最近房间管理等入口能力，并以极简布局聚焦主任务。
+  \item \textbf{白板模块}：基于 Fabric.js 维护画布与对象模型，实现绘制、选择、形状、橡皮与导出等功能。
+  \item \textbf{协作模块}：封装 Socket.IO 连接、房间加入、事件发送与接收，并处理断线重连与版本补包。
+  \item \textbf{公式模块}：完成选区截图、识别请求、结果确认、KaTeX 渲染与双击编辑等流程。
+\end{itemize}
+
+\subsection{后端模块}
+\begin{itemize}
+  \item \textbf{房间管理}：维护房间生命周期与在线用户信息，支持空房间按 TTL 清理。
+  \item \textbf{同步裁决}：对绘制事件进行服务端权威裁决，广播被接受的增量变更，并维护房间版本号与增量日志。
+  \item \textbf{OCR 代理}：提供统一接口，将前端识别请求转发至 OCR 服务并规范化返回结构。
+\end{itemize}
+
+\subsection{OCR 服务模块}
+\begin{itemize}
+  \item \textbf{图像预处理}：对输入截图进行内容裁剪、尺寸对齐、反色/二值化等处理，提升识别成功率。
+  \item \textbf{识别推理与回退}：优先调用公式识别模型，在失败或结果为空时对不同候选图像进行回退尝试。
+  \item \textbf{结果清洗}：对输出 LaTeX 进行噪声清洗（如移除宏定义等），并对空结果统一返回错误码。
+\end{itemize}
+
+\section{关键数据流}
+\subsection{创建/加入房间}
+用户在首页创建房间后，前端生成房间号并进入白板页面；加入房间时，前端对输入进行归一化，支持从任意文本或链接中提取房间号并进入房间。后端根据房间号为连接分配房间上下文，并在必要时向客户端下发状态快照与增量补包。
+
+\subsection{白板协作同步}
+前端对本地对象变更生成增量事件并发送至后端；后端对关键字段进行裁决后广播增量；客户端按版本号补齐缺失增量，必要时请求全量同步。该流程使协作在消息乱序与断线重连场景下仍能尽量保持一致。
+
+\subsection{公式识别与插入}
+用户在白板上框选区域后，前端生成截图并调用后端识别接口；后端将请求转发至 OCR 服务并返回 LaTeX；前端展示识别结果并允许用户确认与编辑，确认后将公式作为可编辑对象插入画布并同步给其他协作者。
+

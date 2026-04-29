@@ -299,7 +299,9 @@ class SocketService {
     const envUrl = String(import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
     const protocol = String(window.location?.protocol || 'http:');
     const host = String(window.location?.hostname || 'localhost');
-    const apiUrl = envUrl || `${protocol}//${host}:3000`;
+    const port = String(window.location?.port || '');
+    const isDev = !!import.meta.env.DEV;
+    const apiUrl = envUrl || (isDev ? `${protocol}//${host}:3000` : `${protocol}//${host}${port ? `:${port}` : ''}`);
     
     if (!this.socket) {
       // 关键点：autoConnect=false

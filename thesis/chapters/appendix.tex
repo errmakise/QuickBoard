@@ -1,0 +1,12 @@
+\appendixsection{项目材料与报告索引}\label{sec:appendix-materials}
+
+\appendixsubsection{项目结构说明}
+QuickBoard 项目由前端、后端与 OCR 服务三部分组成：
+\begin{itemize}
+  \item \textbf{前端}：\texttt{QuickBoard/frontend}，基于 Vue3 + Vite，白板核心组件为 \texttt{src/components/Whiteboard.vue}。
+  \item \textbf{后端}：\texttt{QuickBoard/backend}，基于 Node.js + Socket.IO，提供房间管理、同步裁决与 OCR 代理接口。
+  \item \textbf{OCR 服务}：\texttt{QuickBoard/ocr\_service}，基于 FastAPI，提供数学公式识别与预处理能力。
+\end{itemize}
+
+\appendixsubsection{测试报告索引}
+项目在关键改动后输出测试与验证报告，路径为 \texttt{doc/test\_reports}。报告包含单元测试通过记录、构建通过记录以及针对同步与 OCR 的专项验证结果，便于答辩演示与论文写作引用。

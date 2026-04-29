@@ -12,7 +12,9 @@ export const getApiBaseUrl = () => {
   if (envUrl) return envUrl;
   const protocol = String(window.location?.protocol || 'http:');
   const host = String(window.location?.hostname || 'localhost');
-  return `${protocol}//${host}:3000`;
+  const port = String(window.location?.port || '');
+  const isDev = !!(env && env.DEV);
+  return isDev ? `${protocol}//${host}:3000` : `${protocol}//${host}${port ? `:${port}` : ''}`;
 };
 
 export const recognizeMathFromImageDataUrl = async ({

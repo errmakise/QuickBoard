@@ -419,7 +419,7 @@ const REMOTE_CURSOR_DEADZONE_PX = 0.8;
 const REMOTE_CURSOR_LABEL_PAD_X = 10;
 const REMOTE_CURSOR_LABEL_PAD_Y = 3;
 const REMOTE_CURSOR_LABEL_OFFSET_X = 0;
-const REMOTE_CURSOR_LABEL_OFFSET_Y = 12;
+const REMOTE_CURSOR_LABEL_OFFSET_Y = 26;
 const REMOTE_CURSOR_LABEL_RADIUS = 6;
 const REMOTE_CURSOR_LABEL_TEXT = 'rgba(15,23,42,0.90)';
 const REMOTE_CURSOR_LABEL_BG_ALPHA = 0.32;
@@ -450,14 +450,11 @@ const updateRemoteCursorLabel = (cursor, userId, userName) => {
   const h = typeof label.height === 'number' && Number.isFinite(label.height) ? label.height : 0;
   const bw = Math.max(12, w + REMOTE_CURSOR_LABEL_PAD_X * 2);
   const bh = Math.max(12, h + REMOTE_CURSOR_LABEL_PAD_Y * 2);
-  bg.set({ width: bw, height: bh, left: REMOTE_CURSOR_LABEL_OFFSET_X, top: REMOTE_CURSOR_LABEL_OFFSET_Y });
-  label.set({
-    left: REMOTE_CURSOR_LABEL_OFFSET_X,
-    top: REMOTE_CURSOR_LABEL_OFFSET_Y + (bh - h) / 2
-  });
+  bg.set({ width: bw, height: bh });
+  cursor.labelTextYOffset = (bh - h) / 2;
   bg.dirty = true;
   label.dirty = true;
-  if (cursor.obj) cursor.obj.dirty = true;
+  if (cursor.pointerObj) cursor.pointerObj.dirty = true;
 };
 
 const renderRemoteCursorsOnce = (force = false) => {
@@ -472,8 +469,10 @@ const renderRemoteCursorsOnce = (force = false) => {
   for (const [userId, cursor] of remoteCursorMap.entries()) {
     const lastSeenAt = typeof cursor.lastSeenAt === 'number' ? cursor.lastSeenAt : 0;
     if (!lastSeenAt || now - lastSeenAt > REMOTE_CURSOR_TTL_MS) {
-      if (cursor && cursor.obj && canvas) {
-        canvas.remove(cursor.obj);
+      if (canvas && cursor) {
+        if (cursor.pointerObj) canvas.remove(cursor.pointerObj);
+        if (cursor.labelBgObj) canvas.remove(cursor.labelBgObj);
+        if (cursor.labelObj) canvas.remove(cursor.labelObj);
       }
       remoteCursorMap.delete(userId);
       continue;
@@ -505,19 +504,30 @@ const renderRemoteCursorsOnce = (force = false) => {
     cursor.cx = cx;
     cursor.cy = cy;
 
-    const obj = cursor.obj;
-    if (!obj) continue;
+    const pointerObj = cursor.pointerObj;
+    const labelBgObj = cursor.labelBgObj;
+    const labelObj = cursor.labelObj;
+    if (!pointerObj || !labelBgObj || !labelObj) continue;
     if (typeof invScale === 'number' && Number.isFinite(invScale)) {
       const lastScale = typeof cursor.lastScale === 'number' && Number.isFinite(cursor.lastScale) ? cursor.lastScale : null;
       if (lastScale === null || Math.abs(lastScale - invScale) > 1e-6) {
-        obj.set({ scaleX: invScale, scaleY: invScale });
+        pointerObj.set({ scaleX: invScale, scaleY: invScale });
+        labelBgObj.set({ scaleX: invScale, scaleY: invScale });
+        labelObj.set({ scaleX: invScale, scaleY: invScale });
         cursor.lastScale = invScale;
         anyDirty = true;
       }
     }
-    obj.set({ left: cx, top: cy });
-    if (typeof obj.setCoords === 'function') obj.setCoords();
-    obj.dirty = true;
+    pointerObj.set({ left: cx, top: cy });
+    labelBgObj.set({ left: cx + REMOTE_CURSOR_LABEL_OFFSET_X, top: cy + REMOTE_CURSOR_LABEL_OFFSET_Y });
+    const yoff = typeof cursor.labelTextYOffset === 'number' && Number.isFinite(cursor.labelTextYOffset) ? cursor.labelTextYOffset : REMOTE_CURSOR_LABEL_PAD_Y;
+    labelObj.set({ left: cx + REMOTE_CURSOR_LABEL_OFFSET_X, top: cy + REMOTE_CURSOR_LABEL_OFFSET_Y + yoff });
+    if (typeof pointerObj.setCoords === 'function') pointerObj.setCoords();
+    if (typeof labelBgObj.setCoords === 'function') labelBgObj.setCoords();
+    if (typeof labelObj.setCoords === 'function') labelObj.setCoords();
+    pointerObj.dirty = true;
+    labelBgObj.dirty = true;
+    labelObj.dirty = true;
     anyDirty = true;
     anyActive = true;
   }
@@ -1261,8 +1271,16 @@ const getWorldPointFromClient = (clientX, clientY) => {
   const sy = toFiniteNumber(clientY);
   if (sx === null || sy === null) return null;
   const rect = canvas.upperCanvasEl.getBoundingClientRect();
-  const px = sx - rect.left;
-  const py = sy - rect.top;
+  const elw = toFiniteNumber(canvas.upperCanvasEl.width);
+  const elh = toFiniteNumber(canvas.upperCanvasEl.height);
+  const rw = toFiniteNumber(rect && rect.width);
+  const rh = toFiniteNumber(rect && rect.height);
+  const rs = typeof canvas.getRetinaScaling === 'function' ? toFiniteNumber(canvas.getRetinaScaling()) : null;
+  const retina = rs !== null && rs > 0 ? rs : 1;
+  const scaleX = elw !== null && rw !== null && rw > 0 ? (elw / retina) / rw : 1;
+  const scaleY = elh !== null && rh !== null && rh > 0 ? (elh / retina) / rh : 1;
+  const px = (sx - rect.left) * scaleX;
+  const py = (sy - rect.top) * scaleY;
   const vpt = canvas.viewportTransform || [1, 0, 0, 1, 0, 0];
   const inv = fabric.util.invertTransform(vpt);
   const world = fabric.util.transformPoint(new fabric.Point(px, py), inv);
@@ -1274,11 +1292,6 @@ const getWorldPointFromClient = (clientX, clientY) => {
 
 const getScenePointFromEvent = (evt) => {
   if (!canvas) return null;
-  if (evt && evt.scenePoint) {
-    const x = toFiniteNumber(evt.scenePoint.x);
-    const y = toFiniteNumber(evt.scenePoint.y);
-    if (x !== null && y !== null) return { x, y };
-  }
   if (evt && evt.e && typeof canvas.getScenePoint === 'function') {
     try {
       const p = canvas.getScenePoint(evt.e);
@@ -1289,34 +1302,14 @@ const getScenePointFromEvent = (evt) => {
       void 0;
     }
   }
-  if (evt && evt.e && typeof canvas.getPointer === 'function') {
-    try {
-      const p = canvas.getPointer(evt.e, true);
-      const x = toFiniteNumber(p && p.x);
-      const y = toFiniteNumber(p && p.y);
-      if (x !== null && y !== null) return { x, y };
-    } catch {
-      void 0;
-    }
+  if (evt && evt.e && typeof evt.e.clientX === 'number' && typeof evt.e.clientY === 'number') {
+    const p = getWorldPointFromClient(evt.e.clientX, evt.e.clientY);
+    if (p) return p;
   }
-  if (evt && evt.e && canvas && canvas.upperCanvasEl) {
-    try {
-      const rect = canvas.upperCanvasEl.getBoundingClientRect();
-      const sx = toFiniteNumber(evt.e.clientX);
-      const sy = toFiniteNumber(evt.e.clientY);
-      if (sx !== null && sy !== null) {
-        const px = sx - rect.left;
-        const py = sy - rect.top;
-        const vpt = canvas.viewportTransform || [1, 0, 0, 1, 0, 0];
-        const inv = fabric.util.invertTransform(vpt);
-        const world = fabric.util.transformPoint(new fabric.Point(px, py), inv);
-        const x = toFiniteNumber(world && world.x);
-        const y = toFiniteNumber(world && world.y);
-        if (x !== null && y !== null) return { x, y };
-      }
-    } catch {
-      void 0;
-    }
+  if (evt && evt.scenePoint) {
+    const x = toFiniteNumber(evt.scenePoint.x);
+    const y = toFiniteNumber(evt.scenePoint.y);
+    if (x !== null && y !== null) return { x, y };
   }
   return null;
 };
@@ -1799,6 +1792,16 @@ onMounted(() => {
   brush.width = 5;
   brush.color = '#000000';
   canvas.freeDrawingBrush = brush;
+
+  try {
+    const params = new URLSearchParams(window.location.search || '');
+    const raw = String(params.get('cursorSelfTest') || '').trim().toLowerCase();
+    if (raw && ['1', 'true', 'yes', 'on'].includes(raw)) {
+      setTimeout(() => runRemoteCursorSelfTest(), 300);
+    }
+  } catch {
+    void 0;
+  }
 
   toolRingHostEl = canvasEl.value && canvasEl.value.parentElement ? canvasEl.value.parentElement : null;
   if (toolRingHostEl) {
@@ -2426,7 +2429,7 @@ const initSocket = () => {
     const cursor = remoteCursorMap.get(data.userId);
     if (cursor) {
       updateRemoteCursorLabel(cursor, data.userId, data.userName || '');
-      if (canvas) canvas.requestRenderAll();
+      renderRemoteCursorsOnce(true);
     }
   });
 
@@ -3194,7 +3197,8 @@ const scheduleGhostRender = (userId, pathData) => {
         strokeLineJoin: 'round',
         evented: false,
         selectable: false,
-        hoverCursor: 'default'
+        hoverCursor: 'default',
+        objectCaching: false
       });
       polyline.__isGhost = true;
       polyline.__ghostOwner = userId;
@@ -3208,10 +3212,8 @@ const scheduleGhostRender = (userId, pathData) => {
     // 性能关键点：
     // - 旧实现：每个点都 remove + new + add（会触发大量对象管理与重绘）
     // - 新实现：同一帧把点合并后只更新一次 points 并 requestRenderAll
-    pathData.tempLine.set({ points: pathData.points });
-    if (typeof pathData.tempLine.setCoords === 'function') {
-      pathData.tempLine.setCoords();
-    }
+    pathData.tempLine.dirty = true;
+    pathData.tempLine.cacheDirty = true;
     canvas.requestRenderAll();
   });
 };
@@ -3273,20 +3275,15 @@ const updateRemoteCursor = ({ userId, x, y, userName, seq }) => {
       fill: c.solid,
       originX: 'left',
       originY: 'top',
-      left: 0,
-      top: 0,
+      left: nx,
+      top: ny,
       selectable: false,
       evented: false
     });
-    pointer.shadow = new fabric.Shadow({
-      color: 'rgba(2,6,23,0.28)',
-      blur: 7,
-      offsetX: 0,
-      offsetY: 3
-    });
+    pointer.shadow = null;
     const labelBg = new fabric.Rect({
-      left: REMOTE_CURSOR_LABEL_OFFSET_X,
-      top: REMOTE_CURSOR_LABEL_OFFSET_Y,
+      left: nx + REMOTE_CURSOR_LABEL_OFFSET_X,
+      top: ny + REMOTE_CURSOR_LABEL_OFFSET_Y,
       originX: 'center',
       originY: 'top',
       width: 24,
@@ -3299,43 +3296,36 @@ const updateRemoteCursor = ({ userId, x, y, userName, seq }) => {
       selectable: false,
       evented: false
     });
-    labelBg.shadow = new fabric.Shadow({
-      color: 'rgba(2,6,23,0.10)',
-      blur: 6,
-      offsetX: 0,
-      offsetY: 4
-    });
+    labelBg.shadow = null;
     const label = new fabric.Text(userName || userId.slice(0, 4), {
       fontSize: 11,
       fill: REMOTE_CURSOR_LABEL_TEXT,
       originX: 'center',
       originY: 'top',
-      left: REMOTE_CURSOR_LABEL_OFFSET_X,
-      top: REMOTE_CURSOR_LABEL_OFFSET_Y + REMOTE_CURSOR_LABEL_PAD_Y,
+      left: nx + REMOTE_CURSOR_LABEL_OFFSET_X,
+      top: ny + REMOTE_CURSOR_LABEL_OFFSET_Y + REMOTE_CURSOR_LABEL_PAD_Y,
       fontFamily: 'system-ui',
       fontWeight: '400',
       selectable: false,
       evented: false
     });
     label.shadow = null;
-    const group = new fabric.Group([pointer, labelBg, label], {
-      left: nx,
-      top: ny,
-      originX: 'left',
-      originY: 'top',
-      selectable: false,
-      evented: false,
-      hasControls: false,
-      hasBorders: false,
-      excludeFromExport: true
-    });
-    group.__isGhost = true;
-    canvas.add(group);
+    pointer.__isGhost = true;
+    labelBg.__isGhost = true;
+    label.__isGhost = true;
+    pointer.excludeFromExport = true;
+    labelBg.excludeFromExport = true;
+    label.excludeFromExport = true;
+    canvas.add(labelBg);
+    canvas.add(label);
+    canvas.add(pointer);
     if (typeof canvas.bringObjectToFront === 'function') {
-      canvas.bringObjectToFront(group);
+      canvas.bringObjectToFront(labelBg);
+      canvas.bringObjectToFront(label);
+      canvas.bringObjectToFront(pointer);
     }
     cursor = {
-      obj: group,
+      pointerObj: pointer,
       labelObj: label,
       labelBgObj: labelBg,
       tx: nx,
@@ -3346,7 +3336,8 @@ const updateRemoteCursor = ({ userId, x, y, userName, seq }) => {
       lastSeenAt: 0,
       lastRenderAt: 0,
       snapNext: true,
-      lastScale: null
+      lastScale: null,
+      labelTextYOffset: REMOTE_CURSOR_LABEL_PAD_Y
     };
     remoteCursorMap.set(userId, cursor);
     updateRemoteCursorLabel(cursor, userId, userName);
@@ -3377,14 +3368,42 @@ const refreshRemoteCursors = () => {
 const removeRemoteCursor = (userId) => {
   const cursor = remoteCursorMap.get(userId);
   if (cursor) {
-    if (cursor.obj && canvas) {
-      canvas.remove(cursor.obj);
+    if (canvas) {
+      if (cursor.pointerObj) canvas.remove(cursor.pointerObj);
+      if (cursor.labelBgObj) canvas.remove(cursor.labelBgObj);
+      if (cursor.labelObj) canvas.remove(cursor.labelObj);
     }
     remoteCursorMap.delete(userId);
     if (remoteCursorMap.size === 0 && remoteCursorRafId) {
       cancelAnimationFrame(remoteCursorRafId);
       remoteCursorRafId = 0;
     }
+  }
+};
+
+const runRemoteCursorSelfTest = () => {
+  if (!canvas) return;
+  const x = 220;
+  const y = 180;
+  const h1 = new fabric.Line([x - 16, y, x + 16, y], { stroke: 'rgba(220,38,38,0.92)', strokeWidth: 2, selectable: false, evented: false });
+  const h2 = new fabric.Line([x, y - 16, x, y + 16], { stroke: 'rgba(220,38,38,0.92)', strokeWidth: 2, selectable: false, evented: false });
+  const dot = new fabric.Circle({ left: x, top: y, radius: 3, originX: 'center', originY: 'center', fill: 'rgba(220,38,38,0.92)', selectable: false, evented: false });
+  h1.__isGhost = true;
+  h2.__isGhost = true;
+  dot.__isGhost = true;
+  h1.excludeFromExport = true;
+  h2.excludeFromExport = true;
+  dot.excludeFromExport = true;
+  canvas.add(h1);
+  canvas.add(h2);
+  canvas.add(dot);
+  updateRemoteCursor({ userId: '__cursor_selftest__', x, y, userName: 'selftest', seq: 1 });
+  refreshRemoteCursors();
+  canvas.requestRenderAll();
+  try {
+    window.__qbCursorSelfTest = { x, y, ok: true };
+  } catch {
+    void 0;
   }
 };
 

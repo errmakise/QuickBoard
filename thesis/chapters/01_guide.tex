@@ -1,0 +1,91 @@
+\chapter{绪论}\label{chap:introduction}
+
+\section{研究背景}
+随着在线教学、远程会议与跨地域协作的常态化，团队在讨论过程中的“即时表达”需求不断增强。相较于传统文档协作，白板能够更自然地承载草图、流程图与推导过程，尤其适合用于快速构思与讲解。在实际使用中，用户往往希望在尽量低的门槛下迅速进入协作状态，即“打开即可用、创建即可分享、加入即可同步”。
+
+现有白板产品在功能完整性与使用成本之间通常存在取舍：平台化产品往往引入账号体系、团队空间与复杂权限配置；而极简产品虽然上手快，但在多人同步、网络波动与跨端一致性方面可能出现体验问题。基于上述背景，设计并实现一个聚焦核心协作链路、以房间化方式降低使用成本的在线白板系统具有现实意义。
+
+\section{研究意义}
+本课题的意义主要体现在以下方面：
+\begin{itemize}
+  \item \textbf{工程实践价值}：综合应用现代前端框架、图形渲染与实时通信技术，完成从需求到交付的系统实现与验证闭环。
+  \item \textbf{协作体验价值}：以房间号与邀请链接为核心入口，降低进入协作的操作成本，提升“创建—分享—加入”的效率。
+  \item \textbf{可扩展性价值}：通过清晰的模块边界与同步策略，为后续扩展更多图形组件、增强一致性与持久化能力提供基础。
+\end{itemize}
+
+\section{国内外研究与现状}
+在线白板的发展经历了从单机绘图工具到 Web 化协作平台的演进。产品形态上，一类系统强调极简与快速进入，适合轻量协作；另一类系统更强调团队化与流程化能力，适用于复杂项目管理。技术路线方面，前端多采用基于 Canvas 或 WebGL 的图形渲染方案，协作层多基于 WebSocket 类实时通信实现状态广播与同步；在冲突处理上，常见策略包括按时间戳的最后写入优先、服务端权威裁决以及更复杂的 CRDT/OT 等一致性算法。
+
+在教学与工程讨论场景中，快速创建房间并共享给同伴、在网络波动下仍能保持基本可用，是用户体验的关键。QuickBoard 选择以“轻量房间协作 + 必要绘图工具 + 数学公式识别闭环”为目标，不追求平台化功能，但重点保证核心链路的稳定与快速。
+
+\section{本文主要工作}
+围绕 QuickBoard 在线白板系统，本文完成的主要工作包括：
+\begin{itemize}
+  \item 设计并实现基于房间的白板协作入口，支持创建房间、加入房间与最近房间管理；
+  \item 实现基于 Node.js 与 Socket.IO 的实时协作通信，并采用服务端权威裁决与增量同步策略提升一致性体验；
+  \item 集成 OCR 服务实现数学公式识别，并在前端实现渲染与二次编辑流程；
+  \item 通过单元测试与构建验证等方式对系统进行验证，并在交互与渲染侧进行针对性优化以提升稳定性与响应速度。
+\end{itemize}
+
+\section{论文结构}
+本文结构安排如下：第 \ref{chap:tech} 章介绍系统实现所涉及的关键技术；第 \ref{chap:req} 章进行需求分析；第 \ref{chap:design} 章给出系统总体架构与模块设计；第 \ref{chap:impl} 章阐述关键实现；第 \ref{chap:eval} 章对系统进行测试与评估，并给出总结与展望。
+
+\verb|main.tex| 已预置了完整的论文结构，用户只需修改各 \verb|\input| 文件的内容：
+
+\begin{table}[htbp]
+  \centering
+  \caption{文档结构一览}\label{tab:doc-structure}
+  \renewcommand{\arraystretch}{1.3}
+  \begin{tabular}{llp{7.5cm}}
+    \toprule
+    \textbf{结构} & \textbf{命令} & \textbf{说明} \\
+    \midrule
+    封面       & \verb|\MakeCover|      & 由 \verb|frontcover.tex| 中的信息自动生成 \\
+    信息说明页 & \verb|\MakeInfoPage|   & 由 \verb|infopage.tex| 中的信息自动生成 \\
+    前置部分   & \verb|\frontmatter|    & 页码切换为大写罗马数字（I, II, III\ldots） \\
+    摘要     & \verb|\MakeAbstract|     & 中英文摘要及关键词（\verb|00_abstract.tex|） \\
+    目录     & \verb|\tableofcontents|  & 自动生成；可取消注释 \verb|\listoffigures|、\verb|\listoftables| \\
+    正文     & \verb|\mainmatter|       & 页码切换为阿拉伯数字，从1重新开始 \\
+    参考文献 & \verb|\makereferences|   & 自动排版，格式符合 GB/T 7714 \\
+    附录     & \verb|\appendix|         & 新增「附录」章页，节编号为 A、B、C（\verb|appendix.tex|） \\
+    谢辞     & \verb|\backmatter|       & 取消章编号，页码继续（\verb|ack.tex|） \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+正文各章放在 \verb|chapters/| 下，通过 \verb|main.tex| 中的 \verb|\input{chapters/XX_name}| 注册；参考文献数据库文件在导言区通过 \verb|\tjbibresource{bib/note.bib}| 指定，支持逗号分隔的多个文件。
+
+\section{常用命令速查}
+
+\tabref{tab:template-commands}列出了本模板提供的常用命令，具体用法在后续各章中演示。
+
+\begin{table}[htbp]
+  \centering
+  \caption{模板常用命令}\label{tab:template-commands}
+  \renewcommand{\arraystretch}{1.3}
+  \begin{tabular}{lp{9cm}}
+    \toprule
+    \textbf{命令} & \textbf{用途} \\
+    \midrule
+    \multicolumn{2}{l}{\textbf{交叉引用}} \\
+    \verb|\cref{label}|           & 智能引用，自动生成“第~X~章”“图~X”“式~X”等 \\
+    \verb|\chapref{label}|        & 引用章：第~X~章 \\
+    \verb|\secref{label}|         & 引用节：第~X~节 \\
+    \verb|\figref{label}|         & 引用图：图~X \\
+    \verb|\tabref{label}|         & 引用表：表~X \\
+    \verb|\eqref{label}|          & 引用公式：公式（X） \\
+    \midrule
+    \multicolumn{2}{l}{\textbf{参考文献}} \\
+    \verb|\tjbibresource{file}|   & 导言区指定 \texttt{.bib} 文件 \\
+    \verb|\makereferences|        & 输出参考文献列表 \\
+    \verb|\cite{key}|             & 上标引用 \\
+    \midrule
+    \multicolumn{2}{l}{\textbf{排版辅助}} \\
+    \verb|\pkg{name}|             & 排版宏包名称（带 CTAN 链接） \\
+    \verb|\cs{name}|              & 排版命令名称（如 \cs{section}） \\
+    \verb|\Circled{n}|            & 带圈数字：\Circled{1} \Circled{2} \Circled{3} \\
+    \verb|\TongjiThesis|            & 项目 Logo：\TongjiThesis \\
+    \verb|\dd|, \verb|\ee|, \verb|\ii|, \verb|\jj| & 直立体微分 $\dd$、自然对数底 $\ee$、虚数单位 $\ii$、$\jj$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}

@@ -156,7 +156,7 @@ onUnmounted(() => {
       <div class="mx-auto flex min-h-[calc(100vh-56px)] w-full max-w-6xl items-center py-10 sm:py-14">
         <div class="mx-auto w-full max-w-2xl text-center">
           <h1 class="text-4xl sm:text-6xl font-semibold tracking-tight leading-[1.02]">
-            速绘板，
+            协作白板，把想法画出来，
             <span class="qb-home-slogan">一起更快</span>
           </h1>
           <p class="mt-4 text-sm sm:text-base text-slate-600">创建一个房间，分享链接，立即开始一起画。</p>
