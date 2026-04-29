@@ -230,6 +230,7 @@ let toolRingLongPressStart = null;
 let toolRingActivePointerId = null;
 let toolRingHostEl = null;
 let toolRingDetach = null;
+let globalReleaseDetach = null;
 
 const eraserCursorClientX = ref(-10000);
 const eraserCursorClientY = ref(-10000);
@@ -1932,6 +1933,70 @@ onMounted(() => {
   window.addEventListener('keydown', handleKeydown);
   window.addEventListener('keyup', handleKeyup);
 
+  const stopStuckDrawing = (options) => {
+    const immediate = options && options.immediate === true;
+    const run = () => {
+      if (currentTool.value === 'eraser') {
+        if (isErasing) {
+          isErasing = false;
+          if (erasedObjectIdsInStroke) erasedObjectIdsInStroke.clear();
+          erasedObjectIdsInStroke = null;
+          if (eraserMoveRafId) {
+            cancelAnimationFrame(eraserMoveRafId);
+            eraserMoveRafId = 0;
+          }
+          lastEraserMoveEvent = null;
+        }
+        isMouseDown = false;
+        handleCanvasPanEnd();
+        return;
+      }
+
+      if (currentTool.value === 'rect' || currentTool.value === 'circle') {
+        commitShapeDraft();
+        isMouseDown = false;
+        handleCanvasPanEnd();
+        return;
+      }
+
+      if (!isMouseDown && !isPanning) return;
+      isMouseDown = false;
+      handleCanvasPanEnd();
+      if (canvas && canvas.isDrawingMode) {
+        ghostBrushSender.endStroke();
+        stopLocalDrawingOnce();
+      }
+    };
+
+    if (immediate) {
+      run();
+      return;
+    }
+
+    setTimeout(() => {
+      run();
+    }, 0);
+  };
+
+  const onWindowPointerUp = () => stopStuckDrawing({ immediate: false });
+  const onWindowPointerCancel = () => stopStuckDrawing({ immediate: false });
+  const onWindowBlur = () => stopStuckDrawing({ immediate: true });
+  const onVisibilityChange = () => {
+    if (document.visibilityState !== 'visible') stopStuckDrawing({ immediate: true });
+  };
+
+  window.addEventListener('pointerup', onWindowPointerUp, true);
+  window.addEventListener('pointercancel', onWindowPointerCancel, true);
+  window.addEventListener('blur', onWindowBlur, true);
+  document.addEventListener('visibilitychange', onVisibilityChange, true);
+
+  globalReleaseDetach = () => {
+    window.removeEventListener('pointerup', onWindowPointerUp, true);
+    window.removeEventListener('pointercancel', onWindowPointerCancel, true);
+    window.removeEventListener('blur', onWindowBlur, true);
+    document.removeEventListener('visibilitychange', onVisibilityChange, true);
+  };
+
   // 撤销/重做保护机制变量已在模块级定义，确保各处理函数共享
 
   // 监听选择/变换开始，记录初始状态
@@ -2254,6 +2319,10 @@ onUnmounted(() => {
   if (typeof toolRingDetach === 'function') {
     toolRingDetach();
     toolRingDetach = null;
+  }
+  if (typeof globalReleaseDetach === 'function') {
+    globalReleaseDetach();
+    globalReleaseDetach = null;
   }
   clearToolRingTimers();
   if (netSimPollTimer) {

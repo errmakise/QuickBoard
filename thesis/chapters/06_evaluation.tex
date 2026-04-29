@@ -3,55 +3,83 @@
 本章围绕 QuickBoard 的核心目标进行测试与评估，重点验证：弱网与断线条件下的最终收敛、对象规模增长下的渲染性能，以及高频过程预览链路的网络降载效果。
 
 \section{测试策略}
-项目采用“单元测试 + 构建验证 + 可复核实验”的组合策略：
+本研究采用“单元测试 + 构建验证 + 可复核实验”的组合策略：
 \begin{itemize}
   \item \textbf{单元测试}：覆盖协作通信、OCR 请求与裁剪、同步逻辑等核心模块，降低迭代带来的回归风险。
   \item \textbf{构建验证}：确保生产构建通过，避免仅开发环境可运行的问题。
-  \item \textbf{可复核实验}：以一致性对照实验、渲染性能基准与降载统计测试对关键结论进行量化验证，并形成报告归档。
+  \item \textbf{可复核实验}：以一致性对照实验、渲染性能基准与降载统计测试对关键结论进行量化验证，记录实验参数与原始统计以支持复核。
 \end{itemize}
 
 \section{单元测试与构建结果}
-前端使用 Vitest 执行单元测试，并在每轮关键改动后执行构建验证。测试与构建输出以报告形式归档在 \texttt{doc/test\_reports}，便于回溯与论文撰写引用。
+前端使用 Vitest 执行单元测试，并在关键改动后执行生产构建验证。表 \ref{tab:verification} 汇总了工程验证项与结果，其中“通过”表示该项在本文整理的版本上满足可交付要求。
 
 \begin{table}[htbp]
   \centering
   \caption{工程验证项汇总}\label{tab:verification}
   \renewcommand{\arraystretch}{1.35}
-  \begin{tabular}{lll}
+  \begin{tabular}{llll}
     \toprule
-    \textbf{验证项} & \textbf{目的} & \textbf{结果} \\
+    \textbf{验证项} & \textbf{工具/方式} & \textbf{目的} & \textbf{结果} \\
     \midrule
-    前端单元测试 & 覆盖核心逻辑、降低回归 & 通过 \\
-    前端生产构建 & 确保可交付与可部署 & 通过 \\
-    OCR 识别链路自检 & 验证预处理与返回格式 & 通过 \\
+    前端单元测试 & Vitest & 覆盖核心逻辑、降低回归 & 16/16 通过 \\
+    前端生产构建 & Vite build & 确保可交付与可部署 & 通过 \\
+    后端脚本检查 & Node.js 语法检查 & 避免低级语法错误 & 通过 \\
+    OCR 代码检查 & Python 编译检查 & 避免运行期语法错误 & 通过 \\
+    OCR 链路自检 & 冒烟断言 & 验证预处理与返回格式 & 通过 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
 \section{一致性对照实验：朴素广播 vs.\ LWW+补包}
-为了验证弱网与断线场景下的最终收敛，采用 6 个客户端参与对照实验，并在接收侧引入丢包、延迟与抖动，同时对部分客户端施加断线窗口。评价指标选取“结束时哈希种类数”：对每个客户端结束时的权威对象集合做稳定序列化并计算哈希，统计不同哈希的数量。若系统最终一致，则哈希种类数应为 1；若出现分叉，则大于 1。
+为了验证弱网与断线场景下的最终收敛，采用 6 个客户端参与对照实验，并在接收侧引入丢包、延迟与抖动，同时对部分客户端施加断线窗口。网络扰动参数设为 drop=0.15、delay=90ms、jitter=140ms，断线窗口为 c1、c2 各 2.4s。评价指标选取“结束时哈希种类数”：对每个客户端结束时的权威对象集合做稳定序列化并计算哈希，统计不同哈希的数量。若系统最终一致，则哈希种类数应为 1；若出现分叉，则大于 1。
 
 \begin{table}[htbp]
   \centering
-  \caption{一致性对照实验关键结果}\label{tab:sync-benchmark}
+  \caption{一致性对照实验收敛结果}\label{tab:sync-benchmark}
   \renewcommand{\arraystretch}{1.35}
-  \begin{tabular}{llll}
+  \begin{tabular}{lrr}
     \toprule
-    \textbf{方案} & \textbf{网络扰动} & \textbf{断线窗口} & \textbf{结束时哈希种类数} \\
+    \textbf{方案} & \textbf{收敛前哈希种类数} & \textbf{收敛后哈希种类数} \\
     \midrule
-    朴素广播（naive） & recv drop=0.15, delay=90ms, jitter=140ms & clients=1,2 断线 2400ms & 6 \\
-    LWW+补包（lww） & recv drop=0.15, delay=90ms, jitter=140ms & clients=1,2 断线 2400ms & 1 \\
+    朴素广播（naive） & 6 & 6 \\
+    LWW+补包（lww） & 6 & 1 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
 实验结果表明，朴素广播在丢包与断线条件下容易产生多版本分叉；采用服务端权威裁决、字段级 LWW 与版本补包后，系统能够收敛到单一权威状态。
 
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.85\linewidth]{figures/sync_convergence.png}
+  \caption{同步对照实验的收敛结果对比（哈希种类数）}\label{fig:sync-convergence}
+\end{figure}
+
+\begin{table}[htbp]
+  \centering
+  \caption{同步对照实验的时延与回滚特征}\label{tab:sync-latency}
+  \renewcommand{\arraystretch}{1.35}
+  \begin{tabular}{lllll}
+    \toprule
+    \textbf{方案} & \textbf{p50(ms)} & \textbf{p95(ms)} & \textbf{p99(ms)} & \textbf{回滚覆盖（均值/客户端）} \\
+    \midrule
+    朴素广播（naive） & 321 & 434 & 470 & 512.5 \\
+    LWW+补包（lww） & 298 & 407 & 436 & 0 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.92\linewidth]{figures/sync_latency_percentiles.png}
+  \caption{同步对照实验的端到端时延分位数对比}\label{fig:sync-latency}
+\end{figure}
+
 \subsection{指标适用性讨论}
 “结束时哈希种类数”用于回答“最终是否收敛到同一对象集合”这一问题，其优点是计算简单、可复核且不依赖主观判断。该指标的局限在于无法刻画收敛过程中的短时不一致程度，也无法表达意图保持等更强语义。考虑到 QuickBoard 的目标是短会话协作下的最终可用与可对齐，本章选择该指标与研究目标一致；若进一步研究意图保持或离线合并，则需要引入更细粒度的评估维度与数据结构支持。
 
 \section{渲染性能基准：视口裁剪与对象缓存}
-渲染基准在 6000$\times$6000 世界坐标内生成 5000 个对象，对比 Baseline（\texttt{skipOffscreen=false}, \texttt{objectCaching=false}）与 Optimized（\texttt{skipOffscreen=true}, \texttt{objectCaching=true}）两组配置，采样统计平均渲染耗时。基准结果来自项目归档报告。
+渲染基准在 6000$\times$6000 世界坐标内生成 5000 个对象，对比 Baseline（\texttt{skipOffscreen=false}, \texttt{objectCaching=false}）与 Optimized（\texttt{skipOffscreen=true}, \texttt{objectCaching=true}）两组配置，采样统计平均渲染耗时。基准测试在固定参数下运行并记录统计结果，用于对比两组配置的性能差异。
 
 \begin{table}[htbp]
   \centering
@@ -62,12 +90,19 @@
     \textbf{场景} & \textbf{Baseline avg render(ms)} & \textbf{Optimized avg render(ms)} & \textbf{可见对象占比} \\
     \midrule
     idle & 57.500 & 26.950 & $\approx 2.8\%$ \\
-    pan & 52.275 & 16.225 & $\approx 2.8\%$ \\
+    pan & 52.275 & 16.225 & $\approx 2.9\%$ \\
+    zoom & 54.600 & 13.400 & $\approx 2.9\%$ \\
     \bottomrule
   \end{tabular}
 \end{table}
 
 结果显示，在大对象规模场景下，视口裁剪显著降低参与绘制的对象数量；配合对象缓存可进一步降低重复绘制开销，从而明显降低平均渲染耗时。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.92\linewidth]{figures/render_perf_avg.png}
+  \caption{渲染性能基准的平均渲染耗时对比}\label{fig:render-perf}
+\end{figure}
 
 \section{过程预览降载：Ghost Brush 统计验证}
 过程预览属于高频瞬时数据，若逐点发送容易造成消息风暴并挤占权威增量带宽。针对 Ghost Brush 预览链路，采用算法级统计测试进行验证：10s 内以 4ms 采样（理论 2500 点），通过批处理与限包策略统计实际消息数。
@@ -76,16 +111,22 @@
   \centering
   \caption{Ghost Brush 降载测试关键结果}\label{tab:ghost-brush}
   \renewcommand{\arraystretch}{1.35}
-  \begin{tabular}{llll}
+  \begin{tabular}{llllll}
     \toprule
-    \textbf{采样点数（理论）} & \textbf{实际消息数} & \textbf{降载倍率} & \textbf{isEnd 次数} \\
+    \textbf{采样点数} & \textbf{理论消息数} & \textbf{实际消息数} & \textbf{平均每条点数} & \textbf{最大每条点数} & \textbf{降载倍率} \\
     \midrule
-    2500 & 279 & 8.96$\times$ & 1 \\
+    2500 & 2500 & 279 & 8.99 & 9 & 8.96$\times$ \\
     \bottomrule
   \end{tabular}
 \end{table}
 
 统计结果表明，在保证轨迹连续展示与结束信号正确的前提下，批处理与限包机制能显著降低预览链路的消息数量，有助于降低多人同时书写时的网络压力。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.85\linewidth]{figures/ghost_brush_messages.png}
+  \caption{Ghost Brush 降载前后的消息数量对比}\label{fig:ghost-brush}
+\end{figure}
 
 \section{弱网实验入口示例}
 图 \ref{fig:netsim} 展示了基于 URL 参数启用弱网扰动后的画板页面示例，用于说明实验条件可控。

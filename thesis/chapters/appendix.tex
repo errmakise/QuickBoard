@@ -1,15 +1,22 @@
 \appendixsection{项目材料与报告索引}\label{sec:appendix-materials}
 
 \appendixsubsection{项目结构说明}
-QuickBoard 项目由前端、后端与 OCR 服务三部分组成：
+QuickBoard 系统由前端、后端与 OCR 服务三部分组成：
 \begin{itemize}
-  \item \textbf{前端}：\texttt{QuickBoard/frontend}，基于 Vue3 + Vite，白板核心组件为 \texttt{src/components/Whiteboard.vue}。
-  \item \textbf{后端}：\texttt{QuickBoard/backend}，基于 Node.js + Socket.IO，提供房间管理、同步裁决与 OCR 代理接口。
-  \item \textbf{OCR 服务}：\texttt{QuickBoard/ocr\_service}，基于 FastAPI，提供数学公式识别与预处理能力。
+  \item \textbf{前端 Web 应用}：基于 Vue3 + Vite 与 Fabric.js，负责用户交互与画布渲染，包含白板编辑、房间入口与公式交互等模块。
+  \item \textbf{后端协作服务}：基于 Node.js（Express）与 Socket.IO，负责房间管理、实时事件分发、同步裁决与版本对齐，并提供 OCR 请求的统一代理接口。
+  \item \textbf{OCR 服务}：基于 FastAPI，负责图像预处理与数学公式识别推理，并输出可插入的 LaTeX 表达。
 \end{itemize}
 
-\appendixsubsection{测试报告索引}
-项目在关键改动后输出测试与验证报告，路径为 \texttt{doc/test\_reports}。报告包含单元测试通过记录、构建通过记录以及针对同步与 OCR 的专项验证结果，便于复核与论文写作引用。
+\appendixsubsection{验证材料说明}
+为保证本文结论具有可复核性，关键改动均配套记录单元测试与构建验证结果；针对同步一致性、渲染性能与过程预览降载等关键结论，均记录实验参数、原始统计与结果摘要。相关验证材料随论文一并提交，便于复核与对照。
+
+\appendixsubsection{开题报告图片复用}
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.92\linewidth]{figures/proposal_arch.png}
+  \caption{开题报告阶段技术架构图（复用）}\label{fig:proposal-arch}
+\end{figure}
 
 \appendixsubsection{开题调研与需求分析补充}
 本课题在开题阶段对短会话协作与教学场景的工具需求进行了归纳，并将需求收敛为“进入路径短、表达成本低、协作反馈及时、弱网可恢复、内容可沉淀”五类核心目标。其关键观点可概括如下。
