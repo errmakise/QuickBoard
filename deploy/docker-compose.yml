@@ -34,7 +34,7 @@ services:
       dockerfile: deploy/ocr/Dockerfile
     environment:
       - OCR_WARMUP=0
-    expose:
+      - OCR_WARMUP=1
       - "5007"
 
 volumes:

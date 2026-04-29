@@ -16,7 +16,7 @@ test('normalizeRecognizeMathRequest clamps timeoutMs and keeps debug', () => {
   const r = normalizeRecognizeMathRequest({ imageDataUrl: 'data:image/png;base64,AA', timeoutMs: 999999, debug: true });
   assert.equal(r.ok, true);
   assert.equal(r.debug, true);
-  assert.equal(r.timeoutMs, 60000);
+  assert.equal(r.timeoutMs, 120000);
 });
 
 test('mapUpstreamError maps TIMEOUT', () => {
@@ -44,4 +44,3 @@ test('mapUpstreamSuccess returns ok:true with latex', () => {
   assert.equal(ok.ok, true);
   assert.equal(ok.latex, '$x$');
 });
-

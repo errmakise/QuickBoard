@@ -19,13 +19,13 @@ export const getApiBaseUrl = () => {
 
 export const recognizeMathFromImageDataUrl = async ({
   imageDataUrl,
-  timeoutMs = 25000,
+  timeoutMs = 60000,
   debug = false,
   signal
 }) => {
   const apiUrl = getApiBaseUrl();
   const controller = new AbortController();
-  const timeout = clampNumber(timeoutMs, 500, 60000, 25000);
+  const timeout = clampNumber(timeoutMs, 500, 120000, 60000);
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;

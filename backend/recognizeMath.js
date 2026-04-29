@@ -12,7 +12,7 @@ const normalizeRecognizeMathRequest = (body) => {
     return { ok: false, status: 400, error: 'BAD_IMAGE' };
   }
   const debug = body && body.debug === true;
-  const timeoutMs = clampNumber(body && body.timeoutMs, 2000, 60000, 25000);
+  const timeoutMs = clampNumber(body && body.timeoutMs, 2000, 120000, 60000);
   return { ok: true, imageDataUrl, debug, timeoutMs };
 };
 

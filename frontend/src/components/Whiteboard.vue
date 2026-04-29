@@ -151,8 +151,7 @@ const QB_CURSOR_PRECISE = (() => {
 })();
 
 const QB_CURSOR_ERASER = (() => {
-  const svg = "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><path d='M6 15l7-7 5 5-7 7H6l-2-2z' fill='none' stroke='%23ffffff' stroke-opacity='0.96' stroke-width='3.2' stroke-linejoin='round'/><path d='M6 15l7-7 5 5-7 7H6l-2-2z' fill='none' stroke='%230f172a' stroke-opacity='0.92' stroke-width='1.8' stroke-linejoin='round'/><path d='M12 20h10' stroke='%23ffffff' stroke-opacity='0.96' stroke-width='3.0' stroke-linecap='round'/><path d='M12 20h10' stroke='%230f172a' stroke-opacity='0.92' stroke-width='1.6' stroke-linecap='round'/></svg>";
-  return svgToCursor(svg, 12, 12, 'crosshair');
+  return 'none';
 })();
 
 const setCanvasCursor = (cursor) => {
