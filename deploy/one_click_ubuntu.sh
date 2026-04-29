@@ -16,8 +16,18 @@ if [[ ! -f "${DATA_DIR}/roomStates.json" ]]; then
 fi
 
 cd "${ROOT_DIR}/deploy"
-docker compose up -d --build
-docker compose ps
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "未找到 docker compose / docker-compose，请先安装 Docker Compose。"
+  exit 1
+fi
+
+"${COMPOSE[@]}" up -d --build
+"${COMPOSE[@]}" ps
 
 echo ""
-echo "部署完成： https://${DOMAIN}/"
+echo "部署完成："
+echo "  http://${DOMAIN}/"
