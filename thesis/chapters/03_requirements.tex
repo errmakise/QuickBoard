@@ -23,7 +23,6 @@
 \subsection{实时协作}
 \begin{itemize}
   \item \textbf{多人同步}：同一房间的多个用户可看到彼此的绘制结果与对象变更。
-  \item \textbf{协作光标}：可视化显示远端用户光标位置，提升协作感知。
   \item \textbf{重连与补包}：断线后能够自动重连，并尽量恢复到最新状态，避免刷新回滚。
 \end{itemize}
 
@@ -33,6 +32,29 @@
   \item \textbf{确认插入}：识别结果需支持用户确认后再插入画布，避免误识别污染画布。
   \item \textbf{二次编辑}：插入后的公式可双击进入编辑，实时预览渲染效果并更新画布显示。
 \end{itemize}
+
+\section{典型用例}
+为使需求具备可验证性，本课题将核心流程抽象为代表性用例，并在第 \ref{chap:eval} 章通过实验与场景测试进行验证。
+
+\subsection{用例A：创建房间并分享}
+\textbf{前置条件}：用户打开系统首页。\par
+\textbf{基本流程}：点击创建按钮生成房间号并进入画板；页面展示可分享链接/房间号；其他用户通过链接或房间号加入同一房间。\par
+\textbf{验收要点}：进入路径短、房间号易输入、分享后可直接进入同一协作域。
+
+\subsection{用例B：多人实时绘制与撤销重做}
+\textbf{前置条件}：两名或以上用户处于同一房间。\par
+\textbf{基本流程}：用户 A 绘制路径/形状/文本并产生对象增量；服务端裁决后广播；用户 B 端出现一致对象；撤销/重做操作同步生效。\par
+\textbf{验收要点}：对象集合一致、撤销重做行为多端一致。
+
+\subsection{用例C：断线重连对齐}
+\textbf{前置条件}：房间存在持续编辑且某客户端发生断线。\par
+\textbf{基本流程}：客户端恢复连接后 join-room 携带 clientVersion；服务端根据 roomVersion 与增量日志能力发送 sync-delta 或 sync-state；客户端对齐后继续协作。\par
+\textbf{验收要点}：断线窗口结束后最终收敛，且对齐路径明确。
+
+\subsection{用例D：公式识别与插入}
+\textbf{前置条件}：用户在画布上写出公式或导入手写内容。\par
+\textbf{基本流程}：框选区域并发起识别；返回 LaTeX 或错误码；用户确认/修改后插入为公式对象；远端同步显示并可再次编辑。\par
+\textbf{验收要点}：成功路径闭环；失败路径提示明确；可通过 traceId 与可选 debug 图定位失败原因。
 
 \section{非功能需求}
 \subsection{可用性与易用性}
@@ -44,9 +66,32 @@
 \subsection{稳定性与性能}
 系统需在常见浏览器环境下稳定运行。白板渲染应在多对象场景下保持可交互性，公式识别在失败时应及时返回并允许用户继续操作。
 
+\subsection{可验证指标}
+为提高论文论证的可复核性，本课题将部分非功能需求转化为可量化指标：
+\begin{itemize}
+  \item \textbf{最终收敛}：在丢包与断线场景下，多端结束时的权威对象集合应收敛到单一版本（结束时哈希种类数为 1）。
+  \item \textbf{渲染性能}：在 5000 对象规模的基准场景下，启用视口裁剪与对象缓存后平均渲染耗时应明显下降。
+  \item \textbf{过程降载}：在持续书写输入下，过程预览链路应显著降低消息数量，并保证结束信号正确。
+\end{itemize}
+
+\begin{table}[htbp]
+  \centering
+  \caption{核心需求与验证方式}\label{tab:req-verify}
+  \renewcommand{\arraystretch}{1.35}
+  \begin{tabular}{lll}
+    \toprule
+    \textbf{需求项} & \textbf{验证方式} & \textbf{证据来源} \\
+    \midrule
+    弱网最终收敛 & 一致性对照实验 & \texttt{doc/test\_reports/quickboard\_sync\_benchmark} \\
+    大对象渲染可用 & 渲染性能基准 & \texttt{doc/test\_reports/quickboard\_render\_perf} \\
+    过程预览不拥塞 & Ghost Brush 降载统计 & \texttt{doc/test\_reports/quickboard\_ghost\_brush} \\
+    OCR 可用且可定位 & 场景测试 + 错误码/traceId & 项目日志与截图 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
 \subsection{安全性与隐私}
 系统默认无需用户身份信息，房间链接作为共享入口应避免泄露敏感数据；对于本地保存的最近房间记录，应明确其仅存储在浏览器本地存储中。
 
 \section{约束与边界}
 本项目聚焦本科毕业设计的实现与验证，不包含账号体系、复杂权限管理与长期存储的团队空间等平台化能力。协作一致性以“工程可用与体验稳定”为优先目标，不追求强一致性下的复杂冲突合并算法。
-
